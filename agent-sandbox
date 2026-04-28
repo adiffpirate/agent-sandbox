@@ -1,0 +1,728 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage:
+  agent-sandbox run <agent> <model> (defaults to '$CMD_DEFAULT_RUN_AGENT $CMD_DEFAULT_RUN_LOCAL_MODEL')
+  agent-sandbox ssh <user> <command> (defaults to '$VM_AGENT_USER bash')
+  agent-sandbox build <extra_command_for_cloud_init>
+  agent-sandbox stop
+  agent-sandbox status
+EOF
+  exit 1
+}
+
+#--------------------------------------------------------------------------------
+# VARIABLES
+#--------------------------------------------------------------------------------
+
+SANDBOX_HOME="$HOME/.local/share/agent-sandbox"
+VM_NAME="agent-sandbox"
+VM_DISK_SIZE="10G"
+VM_MEMORY_RAM="2G"
+VM_RESTRICT_NETWORK="${RESTRICT_NETWORK:-on}"
+
+# Base image is Alpine generic UEFI cloud-init image
+DOWNLOAD_IMAGE="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
+BASE_IMAGE="$SANDBOX_HOME/vm-base-image.qcow2"
+# Golden image to create with all packages installed
+GOLDEN_IMAGE="$SANDBOX_HOME/vm-golden-image.qcow2"
+# Overlay image that will be used as VM root disk
+SESSION_IMAGE="$SANDBOX_HOME/vm-session-disk.qcow2"
+
+# UEFI Firmware source and dest paths (we'll use a copy for safety)
+OVMF_CODE_SOURCE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+OVMF_VARS_SOURCE="/usr/share/OVMF/OVMF_VARS_4M.fd"
+OVMF_CODE_COPY="$SANDBOX_HOME/OVMF_CODE.fd"
+OVMF_VARS_COPY="$SANDBOX_HOME/OVMF_VARS.fd"
+
+# Cloud-init seed ISO (used to configure the VM on first boot).
+SEED_ISO="$SANDBOX_HOME/seed.iso"
+USER_DATA="$SANDBOX_HOME/user-data"
+META_DATA="$SANDBOX_HOME/meta-data"
+
+# Dedicated SSH keypair for this sandbox only.
+SSH_KEY="$SANDBOX_HOME/agent-sandbox_ed25519"
+SSH_PUB="$SSH_KEY.pub"
+# SSH is forwarded to localhost on this port.
+SSH_PORT="2222"
+
+# Runtime and log files for QEMU, virtiofsd and HAProxy
+FS_SOCK="$SANDBOX_HOME/virtiofsd.sock"
+QEMU_PIDFILE="$SANDBOX_HOME/qemu.pid"
+QEMU_LOG="$SANDBOX_HOME/qemu.log"
+VIRTIOFSD_PIDFILE="$SANDBOX_HOME/virtiofsd.pid"
+VIRTIOFSD_LOG="$SANDBOX_HOME/virtiofsd.log"
+HAPROXY_CONFIG="$SANDBOX_HOME/haproxy.conf"
+HAPROXY_PIDFILE="$SANDBOX_HOME/haproxy.pid"
+HAPROXY_LOG="$SANDBOX_HOME/haproxy.log"
+
+# QEMU bridge network
+QEMU_MACVTAP_FD="" # Populated by ensure_macvtap
+QEMU_MACVTAP_INTERFACE_NAME="agent-sandbox"
+
+# Username and working directory inside the VM.
+VM_AGENT_USER="agent"
+VM_AGENT_WORKDIR="/home/$VM_AGENT_USER/workdir"
+
+# The only allowed network destination from inside the VM.
+LOCAL_LLM_HOST="${LOCAL_LLM_HOST:-192.168.0.10}"
+LOCAL_LLM_PORT="${LOCAL_LLM_PORT:-11434}"
+QEMU_PROXY_IP_INSIDE_VM="10.0.2.100"
+LOCAL_LLM_URL_BASE="http://$QEMU_PROXY_IP_INSIDE_VM:$LOCAL_LLM_PORT"
+LOCAL_LLM_URL_FULL="$LOCAL_LLM_URL_BASE/v1"
+
+# Default commads
+CMD_DEFAULT_RUN_AGENT="opencode"
+CMD_DEFAULT_RUN_LOCAL_MODEL="code"
+
+#--------------------------------------------------------------------------------
+# MAIN
+#--------------------------------------------------------------------------------
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+  fi
+
+  local subcommand="$1"
+  shift || true
+
+  case "$subcommand" in
+    build)
+      _build $@
+      ;;
+    run)
+      local agent="${1:-$CMD_DEFAULT_RUN_AGENT}"
+      local model="${2:-$CMD_DEFAULT_RUN_LOCAL_MODEL}"
+      shift 2 || true
+      _run $agent $model
+      ;;
+    ssh)
+      local user="${1:-$VM_AGENT_USER}"
+      shift || true
+      local cmd="${@:-bash}"
+      _ssh $user $cmd
+      ;;
+    status)
+      _status
+      ;;
+    stop)
+      _stop
+      ;;
+    clean)
+      _clean
+      ;;
+    purge)
+      _purge
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+_build() {
+  _clean
+  sleep 3 # Delay to make sure files locks are released
+  ensure_prereqs
+  download_base_image
+  create_cloud_init "$@"
+  build_golden_image
+  # Make sure OVMF files are not present for first run
+  # (first run creates another overlay so the VM won't boot using the OVMF files from build)
+  clean_session_files
+}
+
+_run(){
+  ensure_prereqs
+  if [[ ! -f "$GOLDEN_IMAGE" ]]; then _build; fi
+  create_session_overlay
+  start_virtiofsd
+  start_haproxy
+  start_qemu
+  wait_for_ssh
+  mount_workdir
+  run_agent $@
+}
+
+_ssh(){
+  ssh_into_vm $@
+}
+
+_status(){
+  get_status
+}
+
+_stop(){
+  stop_daemons
+}
+
+_clean(){
+  _stop
+  clean_session_files
+}
+
+_purge(){
+  _stop
+  delete_sandbox_dir
+}
+
+#--------------------------------------------------------------------------------
+# UTILS
+#--------------------------------------------------------------------------------
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+virtiofsd_bin() {
+  # Different Ubuntu/QEMU packages place virtiofsd in different paths.
+  if have_cmd virtiofsd; then
+    command -v virtiofsd
+  elif [[ -x /usr/libexec/virtiofsd ]]; then
+    echo /usr/libexec/virtiofsd
+  elif [[ -x /usr/lib/qemu/virtiofsd ]]; then
+    echo /usr/lib/qemu/virtiofsd
+  else
+    return 1
+  fi
+}
+
+#--------------------------------------------------------------------------------
+# PRE REQUISITES
+#--------------------------------------------------------------------------------
+
+ensure_prereqs() {
+  ensure_packages
+  ensure_dirs
+  ensure_ssh_key
+  ensure_uefi
+  ensure_macvtap
+}
+
+ensure_packages() {
+  local missing=0
+
+  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "ts"; do
+    if ! have_cmd "$c"; then
+      echo "Missing command: $c" >&2
+      missing=1
+    fi
+  done
+
+  if ! virtiofsd_bin >/dev/null 2>&1; then
+    echo "Missing command: virtiofsd" >&2
+    missing=1
+  fi
+
+  if [[ ! -f "$OVMF_CODE_SOURCE" ]]; then
+    echo "Missing UEFI firmware: ovmf" >&2
+    missing=1
+  fi
+
+  if [[ ! -e /dev/kvm ]]; then
+    echo "Missing /dev/kvm (KVM not available)" >&2
+    missing=1
+  else
+    if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+      echo "No permission to use /dev/kvm (are you in the kvm group?)" >&2
+      missing=1
+    fi
+  fi
+
+  if [[ "$missing" -ne 0 ]]; then
+    cat >&2 <<'EOF'
+Install prerequisites:
+  sudo apt install -y curl pwgen openssh-client genisoimage qemu-kvm qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy
+
+Ensure KVM is enabled:
+  - BIOS/UEFI virtualization (Intel VT-x / AMD-V)
+  - Kernel module loaded (kvm, kvm_intel or kvm_amd)
+  - User in kvm group: sudo usermod -aG kvm $USER
+EOF
+    exit 1
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$SANDBOX_HOME"
+}
+
+ensure_uefi() {
+  if [[ ! -f "$OVMF_CODE_COPY" ]]; then
+    cp $OVMF_CODE_SOURCE $OVMF_CODE_COPY
+  fi
+  if [[ ! -f "$OVMF_VARS_COPY" ]]; then
+    cp $OVMF_VARS_SOURCE $OVMF_VARS_COPY
+  fi
+}
+
+ensure_macvtap(){
+  if ! ip link show "$QEMU_MACVTAP_INTERFACE_NAME" >/dev/null 2>&1; then
+    # Request user to create bridge for LAN access via macvtap (https://wiki.archlinux.org/title/Macvtap)
+    local host_interface_name="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')"
+    echo "A macvtap network interface is needed for LAN access. Please create it by running:"
+    echo
+    echo "sudo ip link add link $host_interface_name $QEMU_MACVTAP_INTERFACE_NAME type macvtap mode bridge"
+    echo "sudo ip link set $QEMU_MACVTAP_INTERFACE_NAME up"
+    echo "sudo chown $USER:$USER /dev/tap$(cat /sys/class/net/$QEMU_MACVTAP_INTERFACE_NAME/ifindex)"
+    exit 1
+  fi
+  # Get macvtap interface index
+  local macvtap_ifindex="$(cat /sys/class/net/$QEMU_MACVTAP_INTERFACE_NAME/ifindex)"
+  # Opens the macvtap device file and assigns it to a file descriptor that QEMU can use
+  exec {QEMU_MACVTAP_FD}<>/dev/tap$macvtap_ifindex
+}
+
+ensure_ssh_key() {
+  # Create a sandbox-only SSH keypair if it does not already exist.
+  if [[ ! -f "$SSH_KEY" ]]; then
+    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" >/dev/null
+  fi
+}
+
+#--------------------------------------------------------------------------------
+# BUILD
+#--------------------------------------------------------------------------------
+
+download_base_image() {
+  echo "Downloading base image from $DOWNLOAD_IMAGE"
+  # Download the upstream Alpine cloud image only once.
+  if [[ ! -f "$BASE_IMAGE" ]]; then
+    curl -L --fail --progress-bar "$DOWNLOAD_IMAGE" -o "$BASE_IMAGE"
+    # Remove write permissions to avoid tampering
+    chmod -w $BASE_IMAGE
+  fi
+}
+
+create_cloud_init() {
+  extra_cmd="$(tr -d '\n' <<< "$@")"
+  # Generate cloud-init config dynamically for each run.
+  cat >"$USER_DATA" <<EOF
+#cloud-config
+
+packages:
+  - bash
+  - git
+  - curl
+  - ripgrep
+  - build-base
+  - python3-dev
+  - py3-pip
+  - npm
+  - docker
+  - docker-cli
+  - containerd
+
+runcmd:
+  # Install agent: opencode
+  - |
+    npm install -g opencode-linux-x64-musl
+    && ln -s /usr/local/lib/node_modules/opencode-linux-x64-musl/bin/opencode /usr/local/bin/opencode
+  # Install agent: qwen
+  - npm install -g @qwen-code/qwen-code@latest
+  # Install agent: claude
+  - |
+    wget -O /etc/apk/keys/claude-code.rsa.pub https://downloads.claude.ai/keys/claude-code.rsa.pub
+    && echo "https://downloads.claude.ai/claude-code/apk/stable" >> /etc/apk/repositories
+    && apk add claude-code
+  # Enable docker service
+  - rc-update add docker default
+  # Disable GRUB timeout so VM boots instantly
+  - sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub
+  - echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
+  - grub-mkconfig -o /boot/grub/grub.cfg
+  # Disable cloud-init for future boots
+  - touch /etc/cloud/cloud-init.disabled
+  # Run extra cmd
+  - $extra_cmd
+
+# Add SSH public keys to users and disable interactive login
+users:
+  - name: root
+    ssh_authorized_keys:
+      - $(cat "$SSH_PUB")
+
+  - name: $VM_AGENT_USER
+    groups: [$VM_AGENT_USER, docker]
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - $(cat "$SSH_PUB")
+
+  # Disable alpine default user
+  - name: alpine
+    shell: /sbin/nologin
+
+# Set passwords to unlock users, otherwise they cannot SSH
+chpasswd:
+  list: |
+    root:$(pwgen --capitalize --numerals --symbols --secure 50 1)
+    $VM_AGENT_USER:$VM_AGENT_USER
+
+# Disable SSH password login, only key is allowed
+ssh_pwauth: false
+
+# Allow SSH as root but making sure password login is disallowed
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    permissions: '0644'
+    content: |
+      PermitRootLogin prohibit-password
+      PasswordAuthentication no
+      ChallengeResponseAuthentication no
+      UsePAM no
+
+# Poweroff after boot if no errors were found on cloud-init logs
+power_state:
+  mode: poweroff
+  message: "========== CLOUD INIT SUCCESS === POWERING OFF =========="
+  condition: sh -c '! cat /var/log/cloud-init*.log | grep -q -e "ERROR" -e "Error"'
+
+final_message: |
+  --------------------------------------------------------------------------------------------
+  |                                 CLOUD INIT FINISHED                                      |
+  --------------------------------------------------------------------------------------------
+  |   IF YOU ARE SEEING THE LOGIN PROMPT IS BECAUSE SOMETHING WENT WRONG ON CLOUD-INIT       |
+  |   INVESTIGATE THE LOGS: https://docs.cloud-init.io/en/latest/reference/user_files.html   |
+  --------------------------------------------------------------------------------------------
+
+  [TIP] SEE LOGS WITH:      cat /var/log/cloud-init*.log | grep -i error
+  [TIP] SEE STATUS WITH:    cloud-init status -l
+  [TIP] SSH IF AVAILABLE:   agent-sandbox ssh root
+  [TIP] IF NOT LOGIN WITH:  user=$VM_AGENT_USER pass=$VM_AGENT_USER
+
+  Good luck :)
+EOF
+
+  cat >"$META_DATA" <<EOF
+instance-id: agent-sandbox
+local-hostname: agent-sandbox
+EOF
+
+  genisoimage -output "$SEED_ISO" -volid cidata -rock "$USER_DATA" "$META_DATA"
+}
+
+build_golden_image() {
+  # Create overlay for golden image on top of the base image.
+  qemu-img create -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$GOLDEN_IMAGE" $VM_DISK_SIZE
+
+  # Create a temporary VM with golden image and internet access to run cloud-init
+  qemu-system-x86_64 \
+    --enable-kvm \
+    -cpu host -m $VM_MEMORY_RAM \
+    -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE_COPY \
+    -drive if=pflash,format=raw,file=$OVMF_VARS_COPY \
+    -drive file=$GOLDEN_IMAGE,if=virtio,format=qcow2 \
+    -drive file=$SEED_ISO,format=raw \
+    -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22
+
+  echo ""
+  echo "Golden image built at $GOLDEN_IMAGE"
+}
+
+#--------------------------------------------------------------------------------
+# RUN
+#--------------------------------------------------------------------------------
+
+create_session_overlay() {
+  if [[ ! -f "$SESSION_IMAGE" ]]; then
+    # Create a throwaway overlay on top of the golden image.
+    qemu-img create -f qcow2 -b "$GOLDEN_IMAGE" -F qcow2 "$SESSION_IMAGE" $VM_DISK_SIZE
+    echo "VM Session Disk Image created at $SESSION_IMAGE"
+  fi
+}
+
+start_virtiofsd() {
+  if [[ -f "$VIRTIOFSD_PIDFILE" ]]; then
+    echo "virtiofsd is already running, skipping initializaion"
+    return
+  fi
+
+  # Expose the current host directory to the VM as /workdir using virtiofs.
+  echo "Running virtiofs as daemon on background..."
+  nohup $(virtiofsd_bin) \
+    --socket-path="$FS_SOCK" \
+    --shared-dir="$(pwd)" \
+    --sandbox namespace \
+    --uid-map=:1001:$(id -u):1: \
+    --gid-map=:1001:$(id -g):1: \
+	>$VIRTIOFSD_LOG 2>&1 &
+
+  local pid=$!
+  echo $pid > "$VIRTIOFSD_PIDFILE"
+
+  # Wait for socket to be ready
+  local tries=50
+  while [[ ! -S "$FS_SOCK" ]]; do
+    sleep 0.1
+    tries=$((tries - 1))
+    if [[ "$tries" -le 0 ]]; then
+      echo "ERROR: Timed out waiting virtiofsd socket to be available. Check logs at $VIRTIOFSD_LOG" >&2
+      exit 1
+    fi
+  done
+}
+
+start_haproxy(){
+  if [[ -f "$HAPROXY_PIDFILE" ]]; then
+    echo "VM is already running, skipping initializaion"
+    return
+  fi
+
+  if nc -z "127.0.0.1" $LOCAL_LLM_PORT > /dev/null 2>&1; then
+    echo "ERROR: Port $LOCAL_LLM_PORT is already in use. Unable to start haproxy"
+    exit 1
+  fi
+
+  echo "Running haproxy as daemon on background..."
+  cat > "$HAPROXY_CONFIG" <<EOF
+global
+  log stdout format raw local0
+  maxconn 256
+
+defaults
+  mode http
+
+  log global
+  option httplog
+  log-format "[%tr] client=%ci:%cp server=%si:%sp method=%HM path=%HU http=%HV status=%ST req_size=%U resp_size=%B term=%tsc timers=%TR/%Tw/%Tc/%Tr/%Ta"
+
+  timeout connect 1s
+  timeout client 10m
+  timeout server 10m
+
+frontend llm_in
+  bind 0.0.0.0:${LOCAL_LLM_PORT}
+  default_backend llm_out
+
+backend llm_out
+  server llm ${LOCAL_LLM_HOST}:${LOCAL_LLM_PORT}
+EOF
+
+  nohup bash -c "haproxy -f $HAPROXY_CONFIG -db -d 2>&1 | ts '%Y-%m-%d %H:%M:%S'" > $HAPROXY_LOG &
+
+  local pid=$!
+  echo $pid > "$HAPROXY_PIDFILE"
+
+  # Wait for port to be open
+  local tries=50
+  until nc -z "127.0.0.1" $LOCAL_LLM_PORT > /dev/null 2>&1; do
+    sleep 1
+    tries=$((tries - 1))
+    if [[ "$tries" -le 0 ]]; then
+      echo "ERROR: Timed out waiting haproxy port to be open. Check logs with 'journatlctl -u haproxy'" >&2
+      exit 1
+    fi
+  done
+}
+
+start_qemu() {
+  if [[ -f "$QEMU_PIDFILE" ]]; then
+    echo "VM is already running, skipping initializaion"
+    return
+  fi
+
+  echo "Running QEMU/KVM as daemon on background..."
+  qemu-system-x86_64 \
+    -name "$VM_NAME" \
+    --enable-kvm \
+    -cpu "host" -m $VM_MEMORY_RAM \
+    -display "none" -monitor "none" -serial "file:$QEMU_LOG" \
+    -daemonize -pidfile "$QEMU_PIDFILE" \
+    \
+    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE_COPY" \
+    -drive "if=pflash,format=raw,file=$OVMF_VARS_COPY" \
+    \
+    -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
+    -drive "file=$SEED_ISO,format=raw" \
+    \
+    -device "virtio-net-pci,netdev=host" \
+    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22,guestfwd=tcp:$QEMU_PROXY_IP_INSIDE_VM:$LOCAL_LLM_PORT-cmd:socat - TCP:127.0.0.1:$LOCAL_LLM_PORT" \
+    \
+    -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
+    -numa "node,memdev=mem" \
+    -chardev "socket,id=fs0,path="$FS_SOCK"" \
+    -device "vhost-user-fs-pci,chardev=fs0,tag=workdir"
+    # -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22,guestfwd=tcp:$QEMU_PROXY_IP_INSIDE_VM:$LOCAL_LLM_PORT-tcp:127.0.0.1:$LOCAL_LLM_PORT" \
+}
+
+wait_for_ssh() {
+  local tries=20
+  until ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "${VM_AGENT_USER}@127.0.0.1" "echo ok" >/dev/null 2>&1; do
+    echo "Waiting for VM to become reachable over SSH..."
+    sleep 5
+    tries=$((tries - 1))
+    if [[ "$tries" -le 0 ]]; then
+      echo "VM did not become reachable over SSH." >&2
+      echo "Investigate QEMU/KVM logs at $QEMU_LOG" >&2
+      exit 1
+    fi
+  done
+  echo "VM SSH is alive"
+}
+
+mount_workdir() {
+    echo 'Binding current directory with VM'
+    _ssh root "
+      mkdir -p $VM_AGENT_WORKDIR \
+      && modprobe virtiofs 2>/dev/null || true \
+      && mount -t virtiofs workdir $VM_AGENT_WORKDIR
+    "
+}
+
+run_agent(){
+  local agent=$1
+  local model=$2
+  shift 2
+  if [[ $agent == "opencode" ]]; then
+    _ssh $VM_AGENT_USER "
+      mkdir -p ~/.config/opencode
+      && printf '%s' '{
+        \"\$schema\": \"https://opencode.ai/config.json\",
+        \"model\": \"local/$model\",
+        \"provider\": {
+          \"local\": {
+            \"npm\": \"@ai-sdk/openai-compatible\",
+            \"name\": \"Local\",
+            \"options\": {
+              \"baseURL\": \"$LOCAL_LLM_URL_FULL\"
+            },
+            \"models\": {
+              \"$model\": {
+                \"name\": \"$model\"
+              }
+            }
+          }
+        }
+      }' > ~/.config/opencode/opencode.json
+      && opencode
+    "
+  elif [[ $agent == "claude" ]]; then
+    _ssh $VM_AGENT_USER "
+      export ANTHROPIC_BASE_URL='$LOCAL_LLM_URL_BASE'
+      && export ANTHROPIC_AUTH_TOKEN='local'
+      && export ANTHROPIC_API_KEY=''
+      && claude --allow-dangerously-skip-permissions --model $model
+    "
+  elif [[ $agent == "qwen" ]]; then
+    _ssh $VM_AGENT_USER "
+      mkdir -p ~/.qwen
+      && printf '%s' '{
+        \"\$version\": 3,
+        \"modelProviders\": {
+          \"openai\": [
+            {
+              \"id\": \"$model\",
+              \"name\": \"$model\",
+              \"baseUrl\": \"$LOCAL_LLM_URL_FULL\",
+              \"envKey\": \"QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_0_2_100_11434_V1\"
+            }
+          ]
+        },
+        \"security\": {
+          \"auth\": {
+            \"selectedType\": \"openai\"
+          }
+        },
+        \"model\": {
+          \"name\": \"$model\"
+        },
+        \"permissions\": {
+          \"defaultMode\": \"yolo\",
+          \"confirmShellCommands\": false,
+          \"confirmFileEdits\": false
+        },
+        \"env\": {
+          \"QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_0_2_100_11434_V1\": \"local\"
+        }
+      }' > ~/.qwen/settings.json
+      && qwen
+    "
+    elif [[ $agent == "ssh" ]]; then
+      _ssh $VM_AGENT_USER 'bash'
+  fi
+    
+}
+
+#--------------------------------------------------------------------------------
+# SSH
+#--------------------------------------------------------------------------------
+
+ssh_into_vm() {
+  local user=$1
+  shift
+  local cmd="$@"
+  echo "Running '$cmd' inside VM as '$user' user"
+  ssh -tt -i "$SSH_KEY" -p "$SSH_PORT" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "$user@127.0.0.1" \
+    "cd $VM_AGENT_WORKDIR 2>/dev/null || true; exec bash -lc $(printf '%q' "$cmd")"
+}
+
+#--------------------------------------------------------------------------------
+# STATUS
+#--------------------------------------------------------------------------------
+
+get_status() {
+  echo "qem daemon pid: $(cat "$QEMU_PIDFILE" 2>/dev/null || echo stopped)"
+  echo "virtiofs daemon pid: $(cat "$VIRTIOFSD_PIDFILE" 2>/dev/null || echo stopped)"
+  echo "haproxy daemon pid: $(cat "$HAPROXY_PIDFILE" 2>/dev/null || echo stopped)"
+}
+
+#--------------------------------------------------------------------------------
+# STOP
+#--------------------------------------------------------------------------------
+
+stop_daemons() {
+  echo 'Stopping QEMU daemon'
+  if [[ -f "$QEMU_PIDFILE" ]]; then
+    kill "$(cat "$QEMU_PIDFILE")" 2>/dev/null || true
+    rm -f "$QEMU_PIDFILE"
+  fi
+  sleep 1
+
+  echo 'Stopping virtiofs daemon'
+  if [[ -f "$VIRTIOFSD_PIDFILE" ]]; then
+    kill "$(cat "$VIRTIOFSD_PIDFILE")" 2>/dev/null || true
+    rm -f "$VIRTIOFSD_PIDFILE"
+  fi
+  sleep 1
+
+  echo 'Stopping haproxy daemon'
+  if [[ -f "$HAPROXY_PIDFILE" ]]; then
+    kill "$(cat "$HAPROXY_PIDFILE")" 2>/dev/null || true
+    rm -f "$HAPROXY_PIDFILE"
+  fi
+  sleep 1
+}
+
+#--------------------------------------------------------------------------------
+# CLEAN
+#--------------------------------------------------------------------------------
+
+clean_session_files() {
+  for file in "$SESSION_IMAGE" "$OVMF_CODE_COPY" "$OVMF_VARS_COPY"; do
+    echo "Deleting $file"
+    rm -f $file
+  done
+}
+
+#--------------------------------------------------------------------------------
+# PURGE
+#--------------------------------------------------------------------------------
+
+delete_sandbox_dir() {
+  echo "Deleting directory $SANDBOX_HOME with everything inside of it"
+  rm -rfv $SANDBOX_HOME
+}
+
+#--------------------------------------------------------------------------------
+# ENTRYPOINT
+#--------------------------------------------------------------------------------
+
+main "$@"
