@@ -549,16 +549,15 @@ defaults
   mode http
 
   log global
-  log-format "[%[var(txn.req_start)]]~[%tr] req_id=%[var(txn.req_id)] client=%ci:%cp server=%si:%sp method=%HM path=%HU http=%HV status=%ST req_size=%U resp_size=%B term=%tsc conn_retries=%rc srv_queue=%sq backend_queue=%bq actconn=%ac feconn=%fc beconn=%bc srvconn=%sc time_read_headers=%TR time_in_queue=%Tw time_tcp_connect=%Tc time_response=%Tr time_total=%Ta"
+  log-format "[%tr] client=%ci:%cp server=%si:%sp method=%HM path=%HU http=%HV status=%ST req_size=%U resp_size=%B term=%tsc conn_retries=%rc srv_queue=%sq backend_queue=%bq actconn=%ac feconn=%fc beconn=%bc srvconn=%sc time_read_headers=%TR time_in_queue=%Tw time_tcp_connect=%Tc time_response=%Tr time_total=%Ta"
 
   timeout connect 1s
-  timeout client 10m
-  timeout server 10m
+  timeout client 1m
+  timeout server 1m
 
 frontend llm_in
   bind 0.0.0.0:$LOCAL_LLM_PORT
   default_backend llm_out
-  http-request set-var(txn.req_id) req.hdr(x-request-id)
 
 backend llm_out
   server llm $LOCAL_LLM_HOST:$LOCAL_LLM_PORT
