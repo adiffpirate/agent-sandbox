@@ -551,6 +551,7 @@ defaults
   log global
   log-format "[%tr] client=%ci:%cp server=%si:%sp method=%HM path=%HU http=%HV status=%ST req_size=%U resp_size=%B term=%tsc conn_retries=%rc srv_queue=%sq backend_queue=%bq actconn=%ac feconn=%fc beconn=%bc srvconn=%sc time_read_headers=%TR time_in_queue=%Tw time_tcp_connect=%Tc time_response=%Tr time_total=%Ta"
 
+  option http-server-close
   timeout connect 1s
   timeout client 1m
   timeout server 1m
