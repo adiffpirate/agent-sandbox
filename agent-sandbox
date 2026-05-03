@@ -7,8 +7,11 @@ Usage:
   agent-sandbox run <agent> <model> (defaults to '$CMD_DEFAULT_RUN_AGENT $CMD_DEFAULT_RUN_LOCAL_MODEL')
   agent-sandbox ssh <user> <command> (defaults to '$VM_AGENT_USER bash')
   agent-sandbox build <extra_command_for_cloud_init>
-  agent-sandbox stop
+  agent-sandbox sync [filter_regex]
   agent-sandbox status
+  agent-sandbox stop
+  agent-sandbox clean
+  agent-sandbox purge
 EOF
   exit 1
 }
@@ -21,7 +24,7 @@ SANDBOX_HOME="$HOME/.local/share/agent-sandbox"
 VM_NAME="agent-sandbox"
 VM_DISK_SIZE="10G"
 VM_MEMORY_RAM="2G"
-VM_RESTRICT_NETWORK="${RESTRICT_NETWORK:-on}"
+VM_RESTRICT_NETWORK="${VM_RESTRICT_NETWORK:-on}"
 
 # Base image is Alpine generic UEFI cloud-init image
 DOWNLOAD_IMAGE="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
@@ -57,10 +60,6 @@ VIRTIOFSD_LOG="$SANDBOX_HOME/virtiofsd.log"
 HAPROXY_CONFIG="$SANDBOX_HOME/haproxy.conf"
 HAPROXY_PIDFILE="$SANDBOX_HOME/haproxy.pid"
 HAPROXY_LOG="$SANDBOX_HOME/haproxy.log"
-
-# QEMU bridge network
-QEMU_MACVTAP_FD="" # Populated by ensure_macvtap
-QEMU_MACVTAP_INTERFACE_NAME="agent-sandbox"
 
 # Username and working directory inside the VM.
 VM_AGENT_USER="agent"
@@ -227,7 +226,6 @@ ensure_prereqs() {
   ensure_dirs
   ensure_ssh_key
   ensure_uefi
-  ensure_macvtap
 }
 
 ensure_packages() {
@@ -287,23 +285,6 @@ ensure_uefi() {
   if [[ ! -f "$OVMF_VARS_COPY" ]]; then
     cp $OVMF_VARS_SOURCE $OVMF_VARS_COPY
   fi
-}
-
-ensure_macvtap(){
-  if ! ip link show "$QEMU_MACVTAP_INTERFACE_NAME" >/dev/null 2>&1; then
-    # Request user to create bridge for LAN access via macvtap (https://wiki.archlinux.org/title/Macvtap)
-    local host_interface_name="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')"
-    echo "A macvtap network interface is needed for LAN access. Please create it by running:"
-    echo
-    echo "sudo ip link add link $host_interface_name $QEMU_MACVTAP_INTERFACE_NAME type macvtap mode bridge"
-    echo "sudo ip link set $QEMU_MACVTAP_INTERFACE_NAME up"
-    echo "sudo chown $USER:$USER /dev/tap$(cat /sys/class/net/$QEMU_MACVTAP_INTERFACE_NAME/ifindex)"
-    exit 1
-  fi
-  # Get macvtap interface index
-  local macvtap_ifindex="$(cat /sys/class/net/$QEMU_MACVTAP_INTERFACE_NAME/ifindex)"
-  # Opens the macvtap device file and assigns it to a file descriptor that QEMU can use
-  exec {QEMU_MACVTAP_FD}<>/dev/tap$macvtap_ifindex
 }
 
 ensure_ssh_key() {
