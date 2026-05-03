@@ -343,7 +343,6 @@ packages:
   - build-base
   - python3-dev
   - py3-pip
-  - py3-yaml
   - npm
   - docker
   - docker-cli
