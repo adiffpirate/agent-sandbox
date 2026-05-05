@@ -149,8 +149,8 @@ _build() {
 }
 
 _run(){
-  ensure_prereqs
   if [[ ! -f "$GOLDEN_IMAGE" ]]; then _build; fi
+  ensure_prereqs
   create_session_overlay
   start_virtiofsd
   start_haproxy
@@ -178,17 +178,23 @@ _sync(){
 }
 
 _stop(){
-  stop_daemons
+  if [[ -d "$SANDBOX_HOME" ]]; then
+    stop_daemons
+  fi
 }
 
 _clean(){
-  _stop
-  clean_session_files
+  if [[ -d "$SANDBOX_HOME" ]]; then
+    _stop
+    clean_session_files
+  fi
 }
 
 _purge(){
-  _stop
-  delete_sandbox_dir
+  if [[ -d "$SANDBOX_HOME" ]]; then
+    _stop
+    delete_sandbox_dir
+  fi
 }
 
 #--------------------------------------------------------------------------------
