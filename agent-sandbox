@@ -386,7 +386,6 @@ write_files:
   - path: /etc/environment
     permissions: '0644'
     content: |
-      RESTRICT_NETWORK=$VM_RESTRICT_NETWORK
       QEMU_PROXY_IP=$QEMU_PROXY_IP_INSIDE_VM
       LOCAL_LLM_PORT=$LOCAL_LLM_PORT
       LOCAL_LLM_URL_BASE=$LOCAL_LLM_URL_BASE
