@@ -237,7 +237,7 @@ ensure_prereqs() {
 ensure_packages() {
   local missing=0
 
-  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "ts" "registry"; do
+  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "registry" "socat"; do
     if ! have_cmd "$c"; then
       echo "Missing command: $c" >&2
       missing=1
@@ -267,7 +267,7 @@ ensure_packages() {
   if [[ "$missing" -ne 0 ]]; then
     cat >&2 <<'EOF'
 Install prerequisites:
-  sudo apt install -y curl pwgen openssh-client genisoimage qemu-kvm qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy
+  sudo apt install -y curl pwgen openssh-client genisoimage qemu-kvm qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy socat
   curl -L https://github.com/distribution/distribution/releases/download/v3.1.0/registry_3.1.0_linux_amd64.tar.gz -o /tmp/registry.tar.gz
   tar -xzf /tmp/registry.tar.gz -C "/tmp" && sudo mv /tmp/registry /usr/local/bin/registry && sudo chmod +x /usr/local/bin/registry
 
