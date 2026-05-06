@@ -7,7 +7,8 @@ Usage:
   agent-sandbox run <agent> <model> (defaults to '$CMD_DEFAULT_RUN_AGENT $CMD_DEFAULT_RUN_LOCAL_MODEL')
   agent-sandbox ssh <user> <command> (defaults to '$VM_AGENT_USER bash')
   agent-sandbox build <extra_command_for_cloud_init>
-  agent-sandbox sync [filter_regex]
+  agent-sandbox sync docker [filter_regex]
+  agent-sandbox sync file <host_path>[:<vm_path>]
   agent-sandbox status
   agent-sandbox stop
   agent-sandbox clean
@@ -119,8 +120,10 @@ main() {
       _status
       ;;
     sync)
-      local filter_regex="${1:-.*}"
-      _sync "$filter_regex"
+      local sync_mode="${1:-docker}"
+      shift || true
+      local sync_arg="${1:-}"
+      _sync "$sync_mode" "$sync_arg"
       ;;
     stop)
       _stop
@@ -170,11 +173,26 @@ _status(){
 }
 
 _sync(){
+  local sync_mode="$1"
+  local sync_arg="$2"
+
   if ! is_running qemu; then
     echo "ERROR: VM is not running. Unable to sync"
     exit 1
   fi
-  sync_docker "$@"
+
+  case "$sync_mode" in
+    docker)
+      sync_docker "${sync_arg:-.*}"
+      ;;
+    file)
+      sync_files "$sync_arg"
+      ;;
+    *)
+      echo "ERROR: Unknown sync mode '$sync_mode'. Use 'docker' or 'file'."
+      exit 1
+      ;;
+  esac
 }
 
 _stop(){
@@ -770,7 +788,7 @@ ssh_into_vm() {
   local user=$1
   shift
   local cmd="$(tr -d '\n' <<< "$*")"
-  echo "Running '$cmd' inside VM as '$user' user"
+  echo "Running \`$cmd\` inside VM as \`$user\` user"
   ssh -tt -i "$SSH_KEY" -p "$SSH_PORT" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$user@127.0.0.1" \
@@ -793,6 +811,49 @@ sync_docker() {
     docker tag "$img" "$target"
     docker push "$target"
   done
+}
+
+sync_files() {
+  local sync_arg="$1"
+  local host_path="$sync_arg"
+  local vm_path=""
+
+  if [[ "$host_path" == *:* ]]; then
+    host_path="${sync_arg%%:*}"
+    vm_path="${sync_arg#*:}"
+  fi
+
+  if [[ -z "$vm_path" ]]; then
+    vm_path="$host_path"
+  fi
+
+  local ssh_user=""
+  if [[ "$vm_path" == /home/* ]]; then
+    vm_path="/home/$VM_AGENT_USER${vm_path#/home/*}"
+    ssh_user="$VM_AGENT_USER"
+  elif [[ "$vm_path" == /tmp/* ]]; then
+    ssh_user="$VM_AGENT_USER"
+  else
+    ssh_user="root"
+  fi
+
+  if [[ ! -e "$host_path" ]]; then
+    echo "ERROR: Path '$host_path' does not exist"
+    exit 1
+  fi
+
+  echo "Syncing $host_path -> $vm_path"
+
+  # If it's a file, create the directory on VM before copying
+  if [[ -f "$host_path" ]]; then
+    local vm_dir
+    vm_dir=$(dirname "$vm_path")
+    _ssh $VM_AGENT_USER "mkdir -p '$vm_dir'"
+  fi
+
+  scp -i "$SSH_KEY" -P "$SSH_PORT" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -r "$host_path" "${ssh_user}@127.0.0.1:$vm_path"
 }
 
 #--------------------------------------------------------------------------------

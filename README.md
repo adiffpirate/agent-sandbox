@@ -16,6 +16,7 @@ This project provides a controlled environment to:
 - Share only the current directory via virtiofs
 - Restrict network access to only a local LLM endpoint (opt-out, highly recommended)
 - Sync Docker images to a local registry for offline use. Docker will automatically use the registry via a [custom wrapper](https://github.com/adiffpirate/docker-wrapper-custom-registry)
+- Sync files and directories from host to VM via `agent-sandbox sync file`
 
 ## Architecture
 
@@ -105,13 +106,20 @@ Supported agents:
 - `qwen` — [Qwen Code](https://github.com/QwenLM/qwen-code)
 - `ssh` — Raw SSH session into the VM
 
-### Sync Docker images
+### Sync
 
 ```bash
-agent-sandbox sync [filter_regex]
+agent-sandbox sync docker [filter_regex]
+agent-sandbox sync file <host_path>[:<vm_path>]
 ```
 
-Pushes local Docker images to the sandbox's internal registry so the VM can pull them without internet access.
+**`docker`** — Pushes local Docker images matching the filter regex to the sandbox's internal registry
+so the VM can pull them without internet access.
+
+**`file`** — Copies files or directories from the host into the VM using `scp`.
+If only `<host_path>` is provided, `<vm_path>` defaults to the same path
+(with `/home/<user>/...` translated to `/home/agent/...`).
+Paths under `/home` and `/tmp` use the `agent` user; all other paths use `root`.
 
 ### SSH into the VM
 
