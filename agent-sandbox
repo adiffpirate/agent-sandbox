@@ -275,6 +275,7 @@ Ensure KVM is enabled:
   - BIOS/UEFI virtualization (Intel VT-x / AMD-V)
   - Kernel module loaded (kvm, kvm_intel or kvm_amd)
   - User in kvm group: sudo usermod -aG kvm $USER
+  - On WSL2: https://serverfault.com/a/1115773
 EOF
     exit 1
   fi
