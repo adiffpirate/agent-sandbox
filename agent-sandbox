@@ -317,9 +317,25 @@ download_base_image() {
 
 create_cloud_init() {
   extra_cmd="$(tr -d '\n' <<< "${@:-echo}")"
+
+  # Replicate custom CA configuration from host (if present)
+  local custom_ca_config=""
+  if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
+    # Start the bootcmd part that will install ca-certificate package
+    custom_ca_config="bootcmd:\n  - [ cloud-init-per, instance, setup-ca, sh, -c, \"SSL_NO_VERIFY=1 apk add --no-cache --no-check-certificate ca-certificates\" ]\n\n"
+    
+    # Append the ca_certs part
+    custom_ca_config+="ca_certs:\n  trusted:"
+    for cert in /usr/local/share/ca-certificates/*.crt; do
+      custom_ca_config+="\n    - |\n$(sed 's/^/      /' "$cert")"
+    done
+  fi
+
   # Generate cloud-init config dynamically for each run.
   cat >"$USER_DATA" <<EOF
 #cloud-config
+
+$(echo -e "$custom_ca_config")
 
 package_update: true
 packages:
