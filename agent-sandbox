@@ -844,12 +844,10 @@ sync_files() {
 
   echo "Syncing $host_path -> $vm_path"
 
-  # If it's a file, create the directory on VM before copying
-  if [[ -f "$host_path" ]]; then
-    local vm_dir
-    vm_dir=$(dirname "$vm_path")
-    _ssh $VM_AGENT_USER "mkdir -p '$vm_dir'"
-  fi
+  # Make sure dir exists on VM
+  local vm_dir
+  vm_dir=$(dirname "$vm_path")
+  _ssh $VM_AGENT_USER "mkdir -p '$vm_dir'"
 
   scp -i "$SSH_KEY" -P "$SSH_PORT" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
