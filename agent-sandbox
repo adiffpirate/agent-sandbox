@@ -837,6 +837,8 @@ sync_files() {
     ssh_user="root"
   fi
 
+  vm_path="${vm_path%/}"
+
   if [[ ! -e "$host_path" ]]; then
     echo "ERROR: Path '$host_path' does not exist"
     exit 1
