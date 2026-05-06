@@ -829,7 +829,7 @@ sync_files() {
 
   local ssh_user=""
   if [[ "$vm_path" == /home/* ]]; then
-    vm_path="/home/$VM_AGENT_USER${vm_path#/home/*}"
+    vm_path="/home/$VM_AGENT_USER/${vm_path#/home/*/}"
     ssh_user="$VM_AGENT_USER"
   elif [[ "$vm_path" == /tmp/* ]]; then
     ssh_user="$VM_AGENT_USER"
