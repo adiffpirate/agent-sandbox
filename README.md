@@ -63,11 +63,8 @@ The sandbox runs a headless Alpine Linux VM using QEMU/KVM with the following co
 Download the script and install it into your system path:
 
 ```bash
-sudo curl -L \
-  https://github.com/adiffpirate/agent-sandbox/raw/refs/heads/main/agent-sandbox \
-  -o /usr/local/bin/agent-sandbox
-
-sudo chmod +x /usr/local/bin/agent-sandbox
+curl -L https://github.com/adiffpirate/agent-sandbox/raw/refs/heads/main/agent-sandbox -o ~/.local/bin/agent-sandbox
+chmod +x ~/.local/bin/agent-sandbox
 ```
 
 Verify installation:
