@@ -30,7 +30,7 @@ The sandbox runs a headless Alpine Linux VM using QEMU/KVM with the following co
 │  │                                                    │                 │
 │  │  ┌──────────────┐   ┌────────────┐   ┌──────────┐  │                 │
 │  │  │    Agent     │   │   Docker   │   │   SSH    │  │                 │
-│  │  │    (CLI)     │   │   Wrapper  │   │   :22    │  │                 │
+│  │  │    (CLI)     │   │   Wrapper  │   │  :22     │  │                 │
 │  │  └──────┬───────┘   └──────┬─────┘   └─────▲────┘  │                 │
 │  │         │                  │               │       ├─────┐           │
 │  └─────────┼──────────────────┼───────────────┼───────┘     │           │
@@ -70,21 +70,17 @@ chmod +x ~/.local/bin/agent-sandbox
 Verify installation:
 
 ```bash
-agent-sandbox help
+agent-sandbox
 ```
 
 This installs `agent-sandbox` as a global command available from anywhere on your system.
-
-## Requirements
-
-The script will verify prerequisites automatically.
 
 ## Usage
 
 ### Build the golden image
 
 ```bash
-agent-sandbox build [extra_commands]
+agent-sandbox build [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>]
 ```
 
 Creates a golden image with all packages (bash, vim, git, curl, ripgrep, python3, npm, docker, containerd) and agent runtimes (opencode, Claude Code, Qwen Code) pre-installed.
@@ -92,10 +88,12 @@ Creates a golden image with all packages (bash, vim, git, curl, ripgrep, python3
 ### Run an agent
 
 ```bash
-agent-sandbox run [agent] [model]
+agent-sandbox run [--agent <agent>] [--model <model>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off]
 ```
 
 Starts the VM and runs the specified agent connected to your local LLM. Defaults to `opencode` with model `code`.
+
+**Note**: `agent-sandbox build` must be run before `run`.
 
 Supported agents:
 - `opencode` — [opencode.ai](https://opencode.ai)
@@ -135,12 +133,23 @@ agent-sandbox clean     # Stop VM and remove session overlay (keeps golden image
 agent-sandbox purge     # Delete everything including the golden image
 ```
 
-### Environment variables
+### Run options
 
-| Variable | Default | Description |
+| Flag | Default | Description |
 |---|---|---|
-| `LOCAL_LLM_HOST` | `192.168.0.10` | Host where the local LLM is running |
-| `LOCAL_LLM_PORT` | `11434` | Port of the local LLM |
-| `VM_RESTRICT_NETWORK` | `on` | Restrict VM network to only local LLM and registry |
-| `VM_MEMORY_RAM` | `2G` | VM memory allocation |
-| `VM_DISK_SIZE` | `10G` | VM disk size |
+| `--agent` | `opencode` | Agent to run (opencode, claude, qwen, ssh) |
+| `--model` | `code` | Model to use |
+| `--vm-memory` | `4G` | VM RAM (e.g. 4G, 8G) |
+| `--vm-threads` | 80% of host | VM CPU threads |
+| `--local-llm-host` | `192.168.0.10` | Host IP for LLM proxy |
+| `--local-llm-port` | `11434` | Host port for LLM proxy |
+| `--restrict-network` | `on` | Restrict VM network to only LLM and registry |
+
+### Build options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--vm-memory` | `4G` | VM RAM (e.g. 4G, 8G) |
+| `--vm-threads` | 80% of host | VM CPU threads |
+| `--local-llm-host` | `192.168.0.10` | Host IP for LLM proxy |
+| `--local-llm-port` | `11434` | Host port for LLM proxy |

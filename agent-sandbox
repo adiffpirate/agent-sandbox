@@ -4,15 +4,30 @@ set -euo pipefail
 usage() {
   cat <<EOF
 Usage:
-  agent-sandbox run <agent> <model> (defaults to '$CMD_DEFAULT_RUN_AGENT $CMD_DEFAULT_RUN_LOCAL_MODEL')
-  agent-sandbox ssh <user> <command> (defaults to '$VM_AGENT_USER bash')
-  agent-sandbox build <extra_command_for_cloud_init>
+  agent-sandbox run [--agent <agent>] [--model <model>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] (requires prior 'build')
+  agent-sandbox ssh <user> <command>
+  agent-sandbox build [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>]
   agent-sandbox sync docker [filter_regex]
   agent-sandbox sync file <host_path>[:<vm_path>]
   agent-sandbox status
   agent-sandbox stop
   agent-sandbox clean
   agent-sandbox purge
+
+Run options:
+  --agent <agent>            Agent to run (opencode, claude, qwen, ssh). Default: opencode
+  --model <model>            Model to use. Default: code
+  --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
+  --vm-threads <count>       VM CPU threads. Default: 80% of host threads
+  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.10
+  --local-llm-port <port>    Host port for LLM proxy. Default: 11434
+  --restrict-network on|off  Restrict VM network. Default: on
+
+Build options:
+  --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
+  --vm-threads <count>       VM CPU threads. Default: 80% of host threads
+  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.10
+  --local-llm-port <port>    Host port for LLM proxy. Default: 11434
 EOF
   exit 1
 }
@@ -24,8 +39,10 @@ EOF
 SANDBOX_HOME="$HOME/.local/share/agent-sandbox"
 VM_NAME="agent-sandbox"
 VM_DISK_SIZE="10G"
-VM_MEMORY_RAM="2G"
-VM_RESTRICT_NETWORK="${VM_RESTRICT_NETWORK:-on}"
+VM_MEMORY_RAM="4G"
+VM_THREADS=$(( $(nproc 2>/dev/null || echo 4) * 80 / 100 ))
+if [[ "$VM_THREADS" -lt 1 ]]; then VM_THREADS=4; fi
+VM_RESTRICT_NETWORK="on"
 
 # Base image is Alpine generic UEFI cloud-init image
 DOWNLOAD_IMAGE="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
@@ -67,8 +84,8 @@ VM_AGENT_USER="agent"
 VM_AGENT_WORKDIR="/home/$VM_AGENT_USER/workdir"
 
 # The only allowed network destination from inside the VM.
-LOCAL_LLM_HOST="${LOCAL_LLM_HOST:-192.168.0.10}"
-LOCAL_LLM_PORT="${LOCAL_LLM_PORT:-11434}"
+LOCAL_LLM_HOST="192.168.0.10"
+LOCAL_LLM_PORT="11434"
 QEMU_PROXY_IP_INSIDE_VM="10.0.2.100"
 LOCAL_LLM_URL_BASE="http://$QEMU_PROXY_IP_INSIDE_VM:$LOCAL_LLM_PORT"
 LOCAL_LLM_URL_FULL="$LOCAL_LLM_URL_BASE/v1"
@@ -100,21 +117,68 @@ main() {
   local subcommand="$1"
   shift || true
 
+  # Parse per-command flags
   case "$subcommand" in
     build)
-      _build "$*"
+      local agent="$CMD_DEFAULT_RUN_AGENT"
+      local model="$CMD_DEFAULT_RUN_LOCAL_MODEL"
+      local vm_memory="$VM_MEMORY_RAM"
+      local vm_threads="$VM_THREADS"
+      local local_llm_host="$LOCAL_LLM_HOST"
+      local local_llm_port="$LOCAL_LLM_PORT"
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --agent) agent="$2"; shift 2 ;;
+          --model) model="$2"; shift 2 ;;
+          --vm-memory) vm_memory="$2"; shift 2 ;;
+          --vm-threads) vm_threads="$2"; shift 2 ;;
+          --local-llm-host) local_llm_host="$2"; shift 2 ;;
+          --local-llm-port) local_llm_port="$2"; shift 2 ;;
+          *) usage ;;
+        esac
+      done
+
+      VM_MEMORY_RAM="$vm_memory"
+      VM_THREADS="$vm_threads"
+      LOCAL_LLM_HOST="$local_llm_host"
+      LOCAL_LLM_PORT="$local_llm_port"
+      _build "$agent" "$model"
       ;;
     run)
-      local agent="${1:-$CMD_DEFAULT_RUN_AGENT}"
-      local model="${2:-$CMD_DEFAULT_RUN_LOCAL_MODEL}"
-      shift 2 || true
-      _run $agent $model
+      local agent="$CMD_DEFAULT_RUN_AGENT"
+      local model="$CMD_DEFAULT_RUN_LOCAL_MODEL"
+      local vm_memory="$VM_MEMORY_RAM"
+      local vm_threads="$VM_THREADS"
+      local local_llm_host="$LOCAL_LLM_HOST"
+      local local_llm_port="$LOCAL_LLM_PORT"
+      local restrict_network="$VM_RESTRICT_NETWORK"
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --agent) agent="$2"; shift 2 ;;
+          --model) model="$2"; shift 2 ;;
+          --vm-memory) vm_memory="$2"; shift 2 ;;
+          --vm-threads) vm_threads="$2"; shift 2 ;;
+          --local-llm-host) local_llm_host="$2"; shift 2 ;;
+          --local-llm-port) local_llm_port="$2"; shift 2 ;;
+          --restrict-network) restrict_network="$2"; shift 2 ;;
+          *) usage ;;
+        esac
+      done
+
+      VM_MEMORY_RAM="$vm_memory"
+      VM_THREADS="$vm_threads"
+      LOCAL_LLM_HOST="$local_llm_host"
+      LOCAL_LLM_PORT="$local_llm_port"
+      VM_RESTRICT_NETWORK="$restrict_network"
+      _run "$agent" "$model"
       ;;
     ssh)
       local user="${1:-$VM_AGENT_USER}"
       shift || true
       local cmd="${*:-bash}"
-      _ssh $user "$cmd"
+      _ssh "$user" "$cmd"
       ;;
     status)
       _status
@@ -141,10 +205,11 @@ main() {
 }
 
 _build() {
+  local extra_cmd="${1:-}"
   _clean
   ensure_prereqs
   download_base_image
-  create_cloud_init "$*"
+  create_cloud_init "$extra_cmd"
   build_golden_image
   # Make sure OVMF files are not present for first run
   # (first run creates another overlay so the VM won't boot using the OVMF files from build)
@@ -152,7 +217,12 @@ _build() {
 }
 
 _run(){
-  if [[ ! -f "$GOLDEN_IMAGE" ]]; then _build; fi
+  local agent="${1:-$CMD_DEFAULT_RUN_AGENT}"
+  local model="${2:-$CMD_DEFAULT_RUN_LOCAL_MODEL}"
+  if [[ ! -f "$GOLDEN_IMAGE" ]]; then
+    echo "ERROR: Golden image not found. Run 'agent-sandbox build' first."
+    exit 1
+  fi
   ensure_prereqs
   create_session_overlay
   start_virtiofsd
@@ -161,7 +231,7 @@ _run(){
   start_qemu
   wait_for_ssh
   mount_workdir
-  run_agent "$@"
+  run_agent "$agent" "$model"
 }
 
 _ssh(){
@@ -334,7 +404,7 @@ download_base_image() {
 }
 
 create_cloud_init() {
-  extra_cmd="$(tr -d '\n' <<< "${@:-echo}")"
+  local extra_cmd="${1:-echo}"
 
   # Replicate custom CA configuration from host (if present)
   local custom_ca_config=""
@@ -495,7 +565,7 @@ build_golden_image() {
   # Create a temporary VM with golden image and internet access to run cloud-init
   qemu-system-x86_64 \
     --enable-kvm \
-    -cpu host -m $VM_MEMORY_RAM \
+    -smp $VM_THREADS -m $VM_MEMORY_RAM \
     -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE_COPY \
     -drive if=pflash,format=raw,file=$OVMF_VARS_COPY \
     -drive file=$GOLDEN_IMAGE,if=virtio,format=qcow2 \
@@ -655,7 +725,7 @@ start_qemu() {
   qemu-system-x86_64 \
     -name "$VM_NAME" \
     --enable-kvm \
-    -cpu "host" -m $VM_MEMORY_RAM \
+    -smp $VM_THREADS -m $VM_MEMORY_RAM \
     -display "none" -monitor "none" -serial "file:$QEMU_LOG" \
     -daemonize -pidfile "$QEMU_PIDFILE" \
     \
