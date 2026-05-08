@@ -231,6 +231,7 @@ _run(){
   start_qemu
   wait_for_ssh
   mount_workdir
+  configure_vm_env
   run_agent "$agent" "$model"
 }
 
@@ -493,15 +494,6 @@ chpasswd:
 ssh_pwauth: false
 
 write_files:
-  # Global environment variables
-  - path: /etc/environment
-    permissions: '0644'
-    content: |
-      QEMU_PROXY_IP=$QEMU_PROXY_IP_INSIDE_VM
-      LOCAL_LLM_PORT=$LOCAL_LLM_PORT
-      LOCAL_LLM_URL_BASE=$LOCAL_LLM_URL_BASE
-      LOCAL_LLM_URL_FULL=$LOCAL_LLM_URL_FULL
-      DOCKER_REGISTRY=$REGISTRY_ENDPOINT
   - path: /etc/bash/bashrc
     append: true
     content: |
@@ -767,6 +759,19 @@ mount_workdir() {
       mkdir -p $VM_AGENT_WORKDIR \
       && modprobe virtiofs 2>/dev/null || true \
       && mount -t virtiofs workdir $VM_AGENT_WORKDIR
+    "
+}
+
+configure_vm_env() {
+    echo 'Configuring VM environment...'
+    _ssh root "
+      cat > /etc/environment <<ENVEOF
+QEMU_PROXY_IP=$QEMU_PROXY_IP_INSIDE_VM
+LOCAL_LLM_PORT=$LOCAL_LLM_PORT
+LOCAL_LLM_URL_BASE=$LOCAL_LLM_URL_BASE
+LOCAL_LLM_URL_FULL=$LOCAL_LLM_URL_FULL
+DOCKER_REGISTRY=$REGISTRY_ENDPOINT
+ENVEOF
     "
 }
 
