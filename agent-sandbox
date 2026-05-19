@@ -766,6 +766,7 @@ configure_vm_env() {
     echo 'Configuring VM environment...'
     _ssh root "
       printf '' > /etc/environment
+      && echo 'RESTRICT_NETWORK=$VM_RESTRICT_NETWORK' >> /etc/environment
       && echo 'QEMU_PROXY_IP=$QEMU_PROXY_IP_INSIDE_VM' >> /etc/environment
       && echo 'LOCAL_LLM_PORT=$LOCAL_LLM_PORT' >> /etc/environment
       && echo 'LOCAL_LLM_URL_BASE=$LOCAL_LLM_URL_BASE' >> /etc/environment
