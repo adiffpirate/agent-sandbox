@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<EOF
 Usage:
-  agent-sandbox run [--agent <agent>] [--model <model>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] (requires prior 'build')
+  agent-sandbox run [--agent <agent>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] (requires prior 'build')
   agent-sandbox ssh <user> <command>
   agent-sandbox build [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>]
   agent-sandbox sync docker [filter_regex]
@@ -17,6 +17,7 @@ Usage:
 Run options:
   --agent <agent>            Agent to run (opencode, claude, qwen, ssh). Default: opencode
   --model <model>            Model to use. Default: code
+  --context-size <size>      Maximum context window for opencode (half for output limit). Default: 124000
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
   --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.10
@@ -33,75 +34,77 @@ EOF
 }
 
 #--------------------------------------------------------------------------------
-# VARIABLES
+# GLOBAL VARIABLES (shared across all instances)
 #--------------------------------------------------------------------------------
 
 SANDBOX_HOME="$HOME/.local/share/agent-sandbox"
-VM_NAME="agent-sandbox"
-VM_DISK_SIZE="10G"
-VM_MEMORY_RAM="4G"
-VM_THREADS=$(( $(nproc 2>/dev/null || echo 4) * 80 / 100 ))
-if [[ "$VM_THREADS" -lt 1 ]]; then VM_THREADS=4; fi
-VM_RESTRICT_NETWORK="on"
-
-# Base image is Alpine generic UEFI cloud-init image
-DOWNLOAD_IMAGE="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
 BASE_IMAGE="$SANDBOX_HOME/vm-base-image.qcow2"
-# Golden image to create with all packages installed
 GOLDEN_IMAGE="$SANDBOX_HOME/vm-golden-image.qcow2"
-# Overlay image that will be used as VM root disk
-SESSION_IMAGE="$SANDBOX_HOME/vm-session-disk.qcow2"
-
-# UEFI Firmware source and dest paths (we'll use a copy for safety)
-OVMF_CODE_SOURCE="/usr/share/OVMF/OVMF_CODE_4M.fd"
-OVMF_VARS_SOURCE="/usr/share/OVMF/OVMF_VARS_4M.fd"
-OVMF_CODE_COPY="$SANDBOX_HOME/OVMF_CODE.fd"
-OVMF_VARS_COPY="$SANDBOX_HOME/OVMF_VARS.fd"
-
-# Cloud-init seed ISO (used to configure the VM on first boot).
 SEED_ISO="$SANDBOX_HOME/seed.iso"
 USER_DATA="$SANDBOX_HOME/user-data"
 META_DATA="$SANDBOX_HOME/meta-data"
-
-# Dedicated SSH keypair for this sandbox only.
 SSH_KEY="$SANDBOX_HOME/agent-sandbox_ed25519"
 SSH_PUB="$SSH_KEY.pub"
-# SSH is forwarded to localhost on this port.
-SSH_PORT="2222"
+OVMF_CODE_COPY="$SANDBOX_HOME/OVMF_CODE.fd"       # read‑only, shared
+DOWNLOAD_IMAGE="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
+OVMF_CODE_SOURCE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+OVMF_VARS_SOURCE="/usr/share/OVMF/OVMF_VARS_4M.fd"
 
-# Runtime and log files for QEMU, virtiofsd and HAProxy
-FS_SOCK="$SANDBOX_HOME/virtiofsd.sock"
-QEMU_PIDFILE="$SANDBOX_HOME/qemu.pid"
-QEMU_LOG="$SANDBOX_HOME/qemu.log"
-VIRTIOFSD_PIDFILE="$SANDBOX_HOME/virtiofsd.sock.pid"
-VIRTIOFSD_LOG="$SANDBOX_HOME/virtiofsd.log"
-HAPROXY_CONFIG="$SANDBOX_HOME/haproxy.conf"
-HAPROXY_PIDFILE="$SANDBOX_HOME/haproxy.pid"
-HAPROXY_LOG="$SANDBOX_HOME/haproxy.log"
+# Workdir of the caller – determines the instance
+WORKDIR="$(pwd)"
 
-# Username and working directory inside the VM.
+#--------------------------------------------------------------------------------
+# PER‑INSTANCE VARIABLES
+#--------------------------------------------------------------------------------
+
+# Unique instance ID derived from the absolute path of WORKDIR
+INSTANCE_ID="inst-$(echo -n "$WORKDIR" | sha256sum | head -c 8)"
+INSTANCE_HOME="$SANDBOX_HOME/instances/$INSTANCE_ID"
+
+# Port offset avoids clashes between concurrent instances
+INSTANCE_PORT_OFFSET=$(( 16#$(echo -n "$INSTANCE_ID" | md5sum | head -c 4) % 1000 ))
+
+# SSH forwarding
+SSH_PORT=$((2222 + INSTANCE_PORT_OFFSET))
+
+# Haproxy (LLM proxy) – listen port on host
+HAPROXY_LISTEN_PORT=$((11434 + INSTANCE_PORT_OFFSET))
+# Actual LLM server address (destination for haproxy)
+LOCAL_LLM_HOST="192.168.0.10"
+LOCAL_LLM_SERVER_PORT="11434"
+
+# Registry
+REGISTRY_LISTEN_PORT=$((5000 + INSTANCE_PORT_OFFSET))
+REGISTRY_ENDPOINT="10.0.2.100:5000"                 # always 5000 inside the VM
+
+# Instance‑specific disk / runtime files
+SESSION_IMAGE="$INSTANCE_HOME/vm-session-disk.qcow2"
+OVMF_VARS_COPY="$INSTANCE_HOME/OVMF_VARS.fd"
+FS_SOCK="$INSTANCE_HOME/virtiofsd.sock"
+QEMU_PIDFILE="$INSTANCE_HOME/qemu.pid"
+QEMU_LOG="$INSTANCE_HOME/qemu.log"
+VIRTIOFSD_PIDFILE="$INSTANCE_HOME/virtiofsd.sock.pid"
+VIRTIOFSD_LOG="$INSTANCE_HOME/virtiofsd.log"
+HAPROXY_CONFIG="$INSTANCE_HOME/haproxy.conf"
+HAPROXY_PIDFILE="$INSTANCE_HOME/haproxy.pid"
+HAPROXY_LOG="$INSTANCE_HOME/haproxy.log"
+REGISTRY_CONFIG="$INSTANCE_HOME/registry.conf"
+REGISTRY_PIDFILE="$INSTANCE_HOME/registry.pid"
+REGISTRY_LOG="$INSTANCE_HOME/registry.log"
+REGISTRY_DIR="$INSTANCE_HOME/registry"
+AGENT_ALIVE="$INSTANCE_HOME/agent.alive"
+
+# VM internals
+VM_NAME="agent-sandbox-$INSTANCE_ID"
+VM_DISK_SIZE="10G"
+VM_MEMORY_RAM="4G"
+VM_THREADS=$(( $(nproc 2>/dev/null || echo 4) * 80 / 100 ))
+[[ "$VM_THREADS" -lt 1 ]] && VM_THREADS=4
+VM_RESTRICT_NETWORK="on"
 VM_AGENT_USER="agent"
 VM_AGENT_WORKDIR="/home/$VM_AGENT_USER/workdir"
 
-# The only allowed network destination from inside the VM.
-LOCAL_LLM_HOST="192.168.0.10"
-LOCAL_LLM_PORT="11434"
-QEMU_PROXY_IP_INSIDE_VM="10.0.2.100"
-LOCAL_LLM_URL_BASE="http://$QEMU_PROXY_IP_INSIDE_VM:$LOCAL_LLM_PORT"
-LOCAL_LLM_URL_FULL="$LOCAL_LLM_URL_BASE/v1"
-
-# OCI registry
-REGISTRY_DIR="$SANDBOX_HOME/registry"
-REGISTRY_LOG="$SANDBOX_HOME/registry.log"
-REGISTRY_CONFIG="$SANDBOX_HOME/registry.conf"
-REGISTRY_PIDFILE="$SANDBOX_HOME/registry.pid"
-REGISTRY_PORT="5000"
-REGISTRY_ENDPOINT="$QEMU_PROXY_IP_INSIDE_VM:$REGISTRY_PORT"
-
-# File to indicate if agent has been already started on VM
-AGENT_ALIVE="$SANDBOX_HOME/agent.alive"
-
-# Default commads
+# Default agent / model
 CMD_DEFAULT_RUN_AGENT="opencode"
 CMD_DEFAULT_RUN_LOCAL_MODEL="code"
 
@@ -117,7 +120,6 @@ main() {
   local subcommand="$1"
   shift || true
 
-  # Parse per-command flags
   case "$subcommand" in
     build)
       local agent="$CMD_DEFAULT_RUN_AGENT"
@@ -125,7 +127,7 @@ main() {
       local vm_memory="$VM_MEMORY_RAM"
       local vm_threads="$VM_THREADS"
       local local_llm_host="$LOCAL_LLM_HOST"
-      local local_llm_port="$LOCAL_LLM_PORT"
+      local local_llm_server_port="$LOCAL_LLM_SERVER_PORT"
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -134,7 +136,7 @@ main() {
           --vm-memory) vm_memory="$2"; shift 2 ;;
           --vm-threads) vm_threads="$2"; shift 2 ;;
           --local-llm-host) local_llm_host="$2"; shift 2 ;;
-          --local-llm-port) local_llm_port="$2"; shift 2 ;;
+          --local-llm-port) local_llm_server_port="$2"; shift 2 ;;
           *) usage ;;
         esac
       done
@@ -142,7 +144,7 @@ main() {
       VM_MEMORY_RAM="$vm_memory"
       VM_THREADS="$vm_threads"
       LOCAL_LLM_HOST="$local_llm_host"
-      LOCAL_LLM_PORT="$local_llm_port"
+      LOCAL_LLM_SERVER_PORT="$local_llm_server_port"
       _build "$agent" "$model"
       ;;
     run)
@@ -151,17 +153,19 @@ main() {
       local vm_memory="$VM_MEMORY_RAM"
       local vm_threads="$VM_THREADS"
       local local_llm_host="$LOCAL_LLM_HOST"
-      local local_llm_port="$LOCAL_LLM_PORT"
+      local local_llm_server_port="$LOCAL_LLM_SERVER_PORT"
+      local context_size=124000
       local restrict_network="$VM_RESTRICT_NETWORK"
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --agent) agent="$2"; shift 2 ;;
           --model) model="$2"; shift 2 ;;
+          --context-size) context_size="$2"; shift 2 ;;
           --vm-memory) vm_memory="$2"; shift 2 ;;
           --vm-threads) vm_threads="$2"; shift 2 ;;
           --local-llm-host) local_llm_host="$2"; shift 2 ;;
-          --local-llm-port) local_llm_port="$2"; shift 2 ;;
+          --local-llm-port) local_llm_server_port="$2"; shift 2 ;;
           --restrict-network) restrict_network="$2"; shift 2 ;;
           *) usage ;;
         esac
@@ -170,9 +174,9 @@ main() {
       VM_MEMORY_RAM="$vm_memory"
       VM_THREADS="$vm_threads"
       LOCAL_LLM_HOST="$local_llm_host"
-      LOCAL_LLM_PORT="$local_llm_port"
+      LOCAL_LLM_SERVER_PORT="$local_llm_server_port"
       VM_RESTRICT_NETWORK="$restrict_network"
-      _run "$agent" "$model"
+      _run "$agent" "$model" "$context_size"
       ;;
     ssh)
       local user="${1:-$VM_AGENT_USER}"
@@ -204,88 +208,6 @@ main() {
   esac
 }
 
-_build() {
-  local extra_cmd="${1:-}"
-  _clean
-  ensure_prereqs
-  download_base_image
-  create_cloud_init "$extra_cmd"
-  build_golden_image
-  # Make sure OVMF files are not present for first run
-  # (first run creates another overlay so the VM won't boot using the OVMF files from build)
-  clean_session_files
-}
-
-_run(){
-  local agent="${1:-$CMD_DEFAULT_RUN_AGENT}"
-  local model="${2:-$CMD_DEFAULT_RUN_LOCAL_MODEL}"
-  if [[ ! -f "$GOLDEN_IMAGE" ]]; then
-    echo "ERROR: Golden image not found. Run 'agent-sandbox build' first."
-    exit 1
-  fi
-  ensure_prereqs
-  create_session_overlay
-  start_virtiofsd
-  start_haproxy
-  start_registry
-  start_qemu
-  wait_for_ssh
-  mount_workdir
-  configure_vm_env
-  run_agent "$agent" "$model"
-}
-
-_ssh(){
-  ssh_into_vm "$@"
-}
-
-_status(){
-  get_status
-}
-
-_sync(){
-  local sync_mode="$1"
-  local sync_arg="$2"
-
-  if ! is_running qemu; then
-    echo "ERROR: VM is not running. Unable to sync"
-    exit 1
-  fi
-
-  case "$sync_mode" in
-    docker)
-      sync_docker "${sync_arg:-.*}"
-      ;;
-    file)
-      sync_files "$sync_arg"
-      ;;
-    *)
-      echo "ERROR: Unknown sync mode '$sync_mode'. Use 'docker' or 'file'."
-      exit 1
-      ;;
-  esac
-}
-
-_stop(){
-  if [[ -d "$SANDBOX_HOME" ]]; then
-    stop_daemons
-  fi
-}
-
-_clean(){
-  if [[ -d "$SANDBOX_HOME" ]]; then
-    _stop
-    clean_session_files
-  fi
-}
-
-_purge(){
-  if [[ -d "$SANDBOX_HOME" ]]; then
-    _stop
-    delete_sandbox_dir
-  fi
-}
-
 #--------------------------------------------------------------------------------
 # UTILS
 #--------------------------------------------------------------------------------
@@ -295,7 +217,6 @@ have_cmd() {
 }
 
 virtiofsd_bin() {
-  # Different Ubuntu/QEMU packages place virtiofsd in different paths.
   if have_cmd virtiofsd; then
     command -v virtiofsd
   elif [[ -x /usr/libexec/virtiofsd ]]; then
@@ -318,7 +239,8 @@ is_running(){
 
 ensure_prereqs() {
   ensure_packages
-  ensure_dirs
+  ensure_global_dirs
+  ensure_instance_dirs
   ensure_ssh_key
   ensure_uefi
 }
@@ -370,57 +292,55 @@ EOF
   fi
 }
 
-ensure_dirs() {
+ensure_global_dirs() {
   mkdir -p "$SANDBOX_HOME"
 }
 
+ensure_instance_dirs() {
+  mkdir -p "$INSTANCE_HOME"
+}
+
 ensure_uefi() {
+  # Shared OVMF_CODE copy
   if [[ ! -f "$OVMF_CODE_COPY" ]]; then
-    cp $OVMF_CODE_SOURCE $OVMF_CODE_COPY
+    cp "$OVMF_CODE_SOURCE" "$OVMF_CODE_COPY"
   fi
+  # Per‑instance OVMF_VARS copy
   if [[ ! -f "$OVMF_VARS_COPY" ]]; then
-    cp $OVMF_VARS_SOURCE $OVMF_VARS_COPY
+    cp "$OVMF_VARS_SOURCE" "$OVMF_VARS_COPY"
   fi
 }
 
 ensure_ssh_key() {
-  # Create a sandbox-only SSH keypair if it does not already exist.
   if [[ ! -f "$SSH_KEY" ]]; then
     ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" >/dev/null
   fi
 }
 
 #--------------------------------------------------------------------------------
-# BUILD
+# BUILD (global operation)
 #--------------------------------------------------------------------------------
 
 download_base_image() {
-  # Download the upstream Alpine cloud image only once.
   if [[ ! -f "$BASE_IMAGE" ]]; then
     echo "Downloading base image from $DOWNLOAD_IMAGE"
     curl -L --fail --progress-bar "$DOWNLOAD_IMAGE" -o "$BASE_IMAGE"
-    # Remove write permissions to avoid accidental tampering
-    chmod -w $BASE_IMAGE
+    chmod -w "$BASE_IMAGE"
   fi
 }
 
 create_cloud_init() {
   local extra_cmd="${1:-echo}"
 
-  # Replicate custom CA configuration from host (if present)
   local custom_ca_config=""
   if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
-    # Start the bootcmd part that will install ca-certificate package
     custom_ca_config="bootcmd:\n  - [ cloud-init-per, instance, setup-ca, sh, -c, \"SSL_NO_VERIFY=1 apk add --no-cache --no-check-certificate ca-certificates\" ]\n\n"
-    
-    # Append the ca_certs part
     custom_ca_config+="ca_certs:\n  trusted:"
     for cert in /usr/local/share/ca-certificates/*.crt; do
       custom_ca_config+="\n    - |\n$(sed 's/^/      /' "$cert")"
     done
   fi
 
-  # Generate cloud-init config dynamically for each run.
   cat >"$USER_DATA" <<EOF
 #cloud-config
 
@@ -456,7 +376,7 @@ runcmd:
   # Enable docker service
   - rc-update add docker default
   # Install docker wrapper to force images be pulled from local registry
-  - mv "$(which docker)" /usr/bin/docker.real
+  - mv "\$(which docker)" /usr/bin/docker.real
   - curl -L https://github.com/adiffpirate/docker-wrapper-custom-registry/raw/refs/heads/main/docker.py -o /usr/local/bin/docker
   - chmod +x /usr/local/bin/docker
   # Disable GRUB timeout so VM boots instantly
@@ -468,43 +388,34 @@ runcmd:
   # Run extra cmd
   - bash -c '$extra_cmd'
 
-# Add SSH public keys to users and disable interactive login
 users:
   - name: root
     ssh_authorized_keys:
       - $(cat "$SSH_PUB")
-
   - name: $VM_AGENT_USER
     groups: [docker]
     shell: /bin/bash
     ssh_authorized_keys:
       - $(cat "$SSH_PUB")
-
-  # Disable alpine default user
   - name: alpine
     shell: /sbin/nologin
 
-# Set passwords to unlock users, otherwise they cannot SSH
 chpasswd:
   list: |
     root:$(pwgen --capitalize --numerals --symbols --secure 50 1)
     $VM_AGENT_USER:$VM_AGENT_USER
 
-# Disable SSH password login, only key is allowed
 ssh_pwauth: false
 
 write_files:
   - path: /etc/bash/bashrc
     append: true
     content: |
-      # Load system environment variables
       if [ -f /etc/environment ]; then
         set -a
         . /etc/environment
         set +a
       fi
-
-  # Allow SSH as root but making sure password login is disallowed
   - path: /etc/ssh/sshd_config.d/99-hardening.conf
     permissions: '0644'
     content: |
@@ -512,15 +423,12 @@ write_files:
       PasswordAuthentication no
       ChallengeResponseAuthentication no
       UsePAM no
-      
-  # Configure docker daemon to allow http connection to local registry
   - path: /etc/docker/daemon.json
     content: |
       {
         "insecure-registries": ["$REGISTRY_ENDPOINT"]
       }
 
-# Poweroff after boot if no errors were found on cloud-init logs
 power_state:
   mode: poweroff
   message: "========== CLOUD INIT SUCCESS === POWERING OFF =========="
@@ -551,17 +459,15 @@ EOF
 }
 
 build_golden_image() {
-  # Create overlay for golden image on top of the base image.
   qemu-img create -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$GOLDEN_IMAGE" $VM_DISK_SIZE
 
-  # Create a temporary VM with golden image and internet access to run cloud-init
   qemu-system-x86_64 \
     --enable-kvm \
     -cpu host -smp $VM_THREADS -m $VM_MEMORY_RAM \
-    -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE_COPY \
-    -drive if=pflash,format=raw,file=$OVMF_VARS_COPY \
-    -drive file=$GOLDEN_IMAGE,if=virtio,format=qcow2 \
-    -drive file=$SEED_ISO,format=raw \
+    -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE_COPY" \
+    -drive if=pflash,format=raw,file="$OVMF_VARS_COPY" \
+    -drive file="$GOLDEN_IMAGE",if=virtio,format=qcow2 \
+    -drive file="$SEED_ISO",format=raw \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22
 
@@ -569,13 +475,22 @@ build_golden_image() {
   echo "Golden image built at $GOLDEN_IMAGE"
 }
 
+_build() {
+  local extra_cmd="${1:-}"
+  _clean
+  ensure_prereqs
+  download_base_image
+  create_cloud_init "$extra_cmd"
+  build_golden_image
+  clean_session_files
+}
+
 #--------------------------------------------------------------------------------
-# RUN
+# RUN (per‑instance)
 #--------------------------------------------------------------------------------
 
 create_session_overlay() {
   if [[ ! -f "$SESSION_IMAGE" ]]; then
-    # Create a throwaway overlay on top of the golden image.
     qemu-img create -f qcow2 -b "$GOLDEN_IMAGE" -F qcow2 "$SESSION_IMAGE" $VM_DISK_SIZE
     echo "VM Session Disk Image created at $SESSION_IMAGE"
   fi
@@ -583,28 +498,25 @@ create_session_overlay() {
 
 start_virtiofsd() {
   if is_running virtiofsd; then
-    echo "virtiofsd is already running, skipping initializaion"
+    echo "virtiofsd already running, skipping"
     return
   fi
 
-  # Expose the current host directory to the VM as /workdir using virtiofs.
-  # (virtiofsd automatically creates pid file)
-  echo "Running virtiofs as daemon on background..."
+  echo "Starting virtiofsd..."
   nohup $(virtiofsd_bin) \
     --socket-path="$FS_SOCK" \
-    --shared-dir="$(pwd)" \
+    --shared-dir="$WORKDIR" \
     --sandbox namespace \
     --uid-map=:1001:$(id -u):1: \
     --gid-map=:1002:$(id -g):1: \
-	>$VIRTIOFSD_LOG 2>&1 &
+    >"$VIRTIOFSD_LOG" 2>&1 &
 
-  # Wait for socket to be ready
   local tries=50
   while [[ ! -S "$FS_SOCK" ]]; do
     sleep 0.1
     tries=$((tries - 1))
     if [[ "$tries" -le 0 ]]; then
-      echo "ERROR: Timed out waiting virtiofsd socket to be available. Check logs at $VIRTIOFSD_LOG" >&2
+      echo "ERROR: Timeout waiting for virtiofsd socket. See $VIRTIOFSD_LOG" >&2
       exit 1
     fi
   done
@@ -612,16 +524,16 @@ start_virtiofsd() {
 
 start_haproxy(){
   if is_running haproxy; then
-    echo "haproxy is already running, skipping initializaion"
+    echo "haproxy already running, skipping"
     return
   fi
 
-  if nc -z "127.0.0.1" $LOCAL_LLM_PORT > /dev/null 2>&1; then
-    echo "ERROR: Port $LOCAL_LLM_PORT is already in use. Unable to start haproxy"
+  if nc -z "127.0.0.1" $HAPROXY_LISTEN_PORT > /dev/null 2>&1; then
+    echo "ERROR: Port $HAPROXY_LISTEN_PORT already in use" >&2
     exit 1
   fi
 
-  echo "Running haproxy as daemon on background..."
+  echo "Starting haproxy on port $HAPROXY_LISTEN_PORT..."
   cat > "$HAPROXY_CONFIG" <<EOF
 global
   log stdout format raw local0
@@ -629,37 +541,32 @@ global
 
 defaults
   mode http
-
   log global
   log-format "[%tr] client=%ci:%cp server=%si:%sp method=%HM path=%HU http=%HV status=%ST req_size=%U resp_size=%B term=%tsc conn_retries=%rc srv_queue=%sq backend_queue=%bq actconn=%ac feconn=%fc beconn=%bc srvconn=%sc time_read_headers=%TR time_in_queue=%Tw time_tcp_connect=%Tc time_response=%Tr time_total=%Ta"
-
   option httpclose
   timeout connect 1s
   timeout client 1m
   timeout server 2m
 
 frontend llm_in
-  bind 0.0.0.0:$LOCAL_LLM_PORT
+  bind 0.0.0.0:$HAPROXY_LISTEN_PORT
   default_backend llm_out
 
 backend llm_out
-  server llm $LOCAL_LLM_HOST:$LOCAL_LLM_PORT
+  server llm $LOCAL_LLM_HOST:$LOCAL_LLM_SERVER_PORT
   option accept-invalid-http-response
 EOF
 
-  # nohup bash -c "haproxy -f $HAPROXY_CONFIG -db -d | ts '%Y-%m-%d %H:%M:%S'" > $HAPROXY_LOG 2>&1 &
-  nohup haproxy -f $HAPROXY_CONFIG -db -d > $HAPROXY_LOG 2>&1 &
-
+  nohup haproxy -f "$HAPROXY_CONFIG" -db -d > "$HAPROXY_LOG" 2>&1 &
   local pid=$!
   echo $pid > "$HAPROXY_PIDFILE"
 
-  # Wait for port to be open
   local tries=50
-  until nc -z "127.0.0.1" $LOCAL_LLM_PORT > /dev/null 2>&1; do
+  until nc -z "127.0.0.1" $HAPROXY_LISTEN_PORT > /dev/null 2>&1; do
     sleep 1
     tries=$((tries - 1))
     if [[ "$tries" -le 0 ]]; then
-      echo "ERROR: Timed out waiting haproxy port to be open. Check logs at $HAPROXY_LOG" >&2
+      echo "ERROR: Timeout waiting for haproxy. See $HAPROXY_LOG" >&2
       exit 1
     fi
   done
@@ -667,41 +574,38 @@ EOF
 
 start_registry(){
   if is_running registry; then
-    echo "registry is already running, skipping initializaion"
+    echo "registry already running, skipping"
     return
   fi
 
-  if nc -z "127.0.0.1" $REGISTRY_PORT > /dev/null 2>&1; then
-    echo "ERROR: Port $REGISTRY_PORT is already in use. Unable to start registry"
+  if nc -z "127.0.0.1" $REGISTRY_LISTEN_PORT > /dev/null 2>&1; then
+    echo "ERROR: Port $REGISTRY_LISTEN_PORT already in use" >&2
     exit 1
   fi
 
-  echo "Running registry as daemon on background..."
+  echo "Starting registry on port $REGISTRY_LISTEN_PORT..."
+  mkdir -p "$REGISTRY_DIR"
   cat > "$REGISTRY_CONFIG" <<EOF
 version: 0.1
 log:
   level: debug
-
 storage:
   filesystem:
     rootdirectory: $REGISTRY_DIR
-
 http:
-  addr: :$REGISTRY_PORT
+  addr: :$REGISTRY_LISTEN_PORT
 EOF
 
-  nohup registry serve $REGISTRY_CONFIG > $REGISTRY_LOG 2>&1 &
-
+  nohup registry serve "$REGISTRY_CONFIG" > "$REGISTRY_LOG" 2>&1 &
   local pid=$!
   echo $pid > "$REGISTRY_PIDFILE"
 
-  # Wait for port to be open
   local tries=50
-  until nc -z "127.0.0.1" $REGISTRY_PORT > /dev/null 2>&1; do
+  until nc -z "127.0.0.1" $REGISTRY_LISTEN_PORT > /dev/null 2>&1; do
     sleep 1
     tries=$((tries - 1))
     if [[ "$tries" -le 0 ]]; then
-      echo "ERROR: Timed out waiting registry port to be open. Check logs at $REGISTRY_LOG" >&2
+      echo "ERROR: Timeout waiting for registry. See $REGISTRY_LOG" >&2
       exit 1
     fi
   done
@@ -709,11 +613,11 @@ EOF
 
 start_qemu() {
   if is_running qemu; then
-    echo "VM is already running, skipping initializaion"
+    echo "VM already running, skipping"
     return
   fi
 
-  echo "Running QEMU/KVM as daemon on background..."
+  echo "Starting QEMU/KVM..."
   qemu-system-x86_64 \
     -name "$VM_NAME" \
     --enable-kvm \
@@ -728,11 +632,11 @@ start_qemu() {
     -drive "file=$SEED_ISO,format=raw" \
     \
     -device "virtio-net-pci,netdev=host" \
-    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,guestfwd=tcp:$QEMU_PROXY_IP_INSIDE_VM:$LOCAL_LLM_PORT-cmd:socat - TCP:127.0.0.1:$LOCAL_LLM_PORT,guestfwd=tcp:$QEMU_PROXY_IP_INSIDE_VM:$REGISTRY_PORT-cmd:socat - TCP:127.0.0.1:$REGISTRY_PORT" \
+    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT" \
     \
     -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
     -numa "node,memdev=mem" \
-    -chardev "socket,id=fs0,path="$FS_SOCK"" \
+    -chardev "socket,id=fs0,path=$FS_SOCK" \
     -device "vhost-user-fs-pci,chardev=fs0,tag=workdir"
 }
 
@@ -741,12 +645,11 @@ wait_for_ssh() {
   until ssh -i "$SSH_KEY" -p "$SSH_PORT" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "${VM_AGENT_USER}@127.0.0.1" "echo ok" >/dev/null 2>&1; do
-    echo "Waiting for VM to become reachable over SSH..."
+    echo "Waiting for VM SSH on port $SSH_PORT..."
     sleep 5
     tries=$((tries - 1))
     if [[ "$tries" -le 0 ]]; then
-      echo "VM did not become reachable over SSH." >&2
-      echo "Investigate QEMU/KVM logs at $QEMU_LOG" >&2
+      echo "VM SSH did not come up. Check $QEMU_LOG" >&2
       exit 1
     fi
   done
@@ -767,10 +670,10 @@ configure_vm_env() {
     _ssh root "
       printf '' > /etc/environment
       && echo 'RESTRICT_NETWORK=$VM_RESTRICT_NETWORK' >> /etc/environment
-      && echo 'QEMU_PROXY_IP=$QEMU_PROXY_IP_INSIDE_VM' >> /etc/environment
-      && echo 'LOCAL_LLM_PORT=$LOCAL_LLM_PORT' >> /etc/environment
-      && echo 'LOCAL_LLM_URL_BASE=$LOCAL_LLM_URL_BASE' >> /etc/environment
-      && echo 'LOCAL_LLM_URL_FULL=$LOCAL_LLM_URL_FULL' >> /etc/environment
+      && echo 'QEMU_PROXY_IP=10.0.2.100' >> /etc/environment
+      && echo 'LOCAL_LLM_PORT=11434' >> /etc/environment
+      && echo 'LOCAL_LLM_URL_BASE=http://10.0.2.100:11434' >> /etc/environment
+      && echo 'LOCAL_LLM_URL_FULL=http://10.0.2.100:11434/v1' >> /etc/environment
       && echo 'DOCKER_REGISTRY=$REGISTRY_ENDPOINT' >> /etc/environment
     "
 }
@@ -778,12 +681,10 @@ configure_vm_env() {
 run_agent(){
   local agent=$1
   local model=$2
-  shift 2
+  local context_size=$3
 
-  # Add '--continue' flag to enter last session if agent is already running on VM 
   local continue_session="$(if [[ -f "$AGENT_ALIVE" ]]; then echo '--continue'; fi)"
 
-  # Configure and run agent
   if [[ $agent == "opencode" ]]; then
     _ssh $VM_AGENT_USER "
       mkdir -p ~/.config/opencode
@@ -795,14 +696,14 @@ run_agent(){
             \"npm\": \"@ai-sdk/openai-compatible\",
             \"name\": \"Local\",
             \"options\": {
-              \"baseURL\": \"$LOCAL_LLM_URL_FULL\"
+              \"baseURL\": \"http://10.0.2.100:11434/v1\"
             },
             \"models\": {
               \"$model\": {
                 \"name\": \"$model\",
                 \"limit\": {
-                  \"context\": 90000,
-                  \"output\": 45000
+                  \"context\": $context_size,
+                  \"output\": $((context_size / 2))
                 }
               }
             }
@@ -813,7 +714,7 @@ run_agent(){
     "
   elif [[ $agent == "claude" ]]; then
     _ssh $VM_AGENT_USER "
-      export ANTHROPIC_BASE_URL='$LOCAL_LLM_URL_BASE'
+      export ANTHROPIC_BASE_URL='http://10.0.2.100:11434'
       && export ANTHROPIC_AUTH_TOKEN='local'
       && export ANTHROPIC_API_KEY=''
       && claude --allow-dangerously-skip-permissions --model $model $continue_session
@@ -828,7 +729,7 @@ run_agent(){
             {
               \"id\": \"$model\",
               \"name\": \"$model\",
-              \"baseUrl\": \"$LOCAL_LLM_URL_FULL\",
+              \"baseUrl\": \"http://10.0.2.100:11434/v1\",
               \"envKey\": \"QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_0_2_100_11434_V1\"
             }
           ]
@@ -852,11 +753,33 @@ run_agent(){
       }' > ~/.qwen/settings.json
       && qwen $continue_session
     "
-    elif [[ $agent == "ssh" ]]; then
-      _ssh $VM_AGENT_USER 'bash'
+  elif [[ $agent == "ssh" ]]; then
+    _ssh $VM_AGENT_USER 'bash'
   fi
-    
-  touch $AGENT_ALIVE
+
+  touch "$AGENT_ALIVE"
+}
+
+_run(){
+  local agent="${1:-$CMD_DEFAULT_RUN_AGENT}"
+  local model="${2:-$CMD_DEFAULT_RUN_LOCAL_MODEL}"
+  local context_size="${3:-124000}"
+
+  if [[ ! -f "$GOLDEN_IMAGE" ]]; then
+    echo "ERROR: Golden image not found. Run 'agent-sandbox build' first."
+    exit 1
+  fi
+
+  ensure_prereqs
+  create_session_overlay
+  start_virtiofsd
+  start_haproxy
+  start_registry
+  start_qemu
+  wait_for_ssh
+  mount_workdir
+  configure_vm_env
+  run_agent "$agent" "$model" "$context_size"
 }
 
 #--------------------------------------------------------------------------------
@@ -867,11 +790,15 @@ ssh_into_vm() {
   local user=$1
   shift
   local cmd="$(tr -d '\n' <<< "$*")"
-  echo "Running \`$cmd\` inside VM as \`$user\` user"
+  echo "Running \`$cmd\` inside VM as \`$user\` on port $SSH_PORT"
   ssh -tt -i "$SSH_KEY" -p "$SSH_PORT" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$user@127.0.0.1" \
     "cd $VM_AGENT_WORKDIR 2>/dev/null || true; exec bash -lc $(printf '%q' "$cmd")"
+}
+
+_ssh(){
+  ssh_into_vm "$@"
 }
 
 #--------------------------------------------------------------------------------
@@ -880,13 +807,11 @@ ssh_into_vm() {
 
 sync_docker() {
   local filter_regex="$1"
-
-  echo "Syncing Docker images to $REGISTRY_ENDPOINT..."
-
+  echo "Syncing Docker images to registry at 127.0.0.1:$REGISTRY_LISTEN_PORT..."
   docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '127.0.0.1' | grep -E "$filter_regex" | while read -r img; do
     echo
     echo "Syncing $img"
-    local target="127.0.0.1:$REGISTRY_PORT/$img"
+    local target="127.0.0.1:$REGISTRY_LISTEN_PORT/$img"
     docker tag "$img" "$target"
     docker push "$target"
   done
@@ -902,9 +827,7 @@ sync_files() {
     vm_path="${sync_arg#*:}"
   fi
 
-  if [[ -z "$vm_path" ]]; then
-    vm_path="$host_path"
-  fi
+  [[ -z "$vm_path" ]] && vm_path="$host_path"
 
   local ssh_user=""
   if [[ "$vm_path" == /home/* ]]; then
@@ -924,8 +847,6 @@ sync_files() {
   fi
 
   echo "Syncing $host_path -> $vm_path"
-
-  # Make sure dir exists on VM
   local vm_dir
   vm_dir=$(dirname "$vm_path")
   _ssh $VM_AGENT_USER "mkdir -p '$vm_dir'"
@@ -935,53 +856,100 @@ sync_files() {
     -r "$host_path" "${ssh_user}@127.0.0.1:$vm_path"
 }
 
+_sync(){
+  local sync_mode="$1"
+  local sync_arg="$2"
+
+  if ! is_running qemu; then
+    echo "ERROR: VM is not running. Unable to sync"
+    exit 1
+  fi
+
+  case "$sync_mode" in
+    docker) sync_docker "${sync_arg:-.*}" ;;
+    file)   sync_files "$sync_arg" ;;
+    *)      echo "ERROR: Unknown sync mode '$sync_mode'. Use 'docker' or 'file'."; exit 1 ;;
+  esac
+}
+
 #--------------------------------------------------------------------------------
-# STATUS
+# STATUS (current instance)
 #--------------------------------------------------------------------------------
 
 get_status() {
-  find $SANDBOX_HOME -name '*.pid' | sort | while read pidfile; do
+  find "$INSTANCE_HOME" -name '*.pid' | sort | while read pidfile; do
     local pname="$(echo "$pidfile" | awk -F/ '{print $NF}' | awk -F. '{print $1}')"
     echo "$pname pid: $(cat "$pidfile" 2>/dev/null || echo stopped)"
   done
 }
 
+_status(){
+  get_status
+}
+
 #--------------------------------------------------------------------------------
-# STOP
+# STOP (current instance)
 #--------------------------------------------------------------------------------
 
 stop_daemons() {
-  find $SANDBOX_HOME -name '*.pid' | while read pidfile; do
+  find "$INSTANCE_HOME" -name '*.pid' | while read pidfile; do
     echo "Stopping $pidfile"
     kill "$(cat $pidfile)" 2>/dev/null || true
     rm -f "$pidfile"
     sleep 1
   done
-  
-  rm -f $AGENT_ALIVE
+  rm -f "$AGENT_ALIVE"
+}
+
+_stop(){
+  if [[ -d "$INSTANCE_HOME" ]]; then
+    stop_daemons
+  fi
 }
 
 #--------------------------------------------------------------------------------
-# CLEAN
+# CLEAN (current instance)
 #--------------------------------------------------------------------------------
 
 clean_session_files() {
-  for file in "$SESSION_IMAGE" "$OVMF_CODE_COPY" "$OVMF_VARS_COPY"; do
+  for file in "$SESSION_IMAGE" "$OVMF_VARS_COPY"; do
     if [[ -f "$file" ]]; then
       echo "Deleting $file"
-      rm -f $file
-      sleep 2 # Delay to make sure files locks are released
+      rm -f "$file"
+      sleep 2
     fi
   done
 }
 
+_clean(){
+  if [[ -d "$INSTANCE_HOME" ]]; then
+    _stop
+    clean_session_files
+  fi
+}
+
 #--------------------------------------------------------------------------------
-# PURGE
+# PURGE (everything)
 #--------------------------------------------------------------------------------
 
 delete_sandbox_dir() {
-  echo "Deleting directory $SANDBOX_HOME with everything inside of it"
-  rm -rfv $SANDBOX_HOME
+  echo "Deleting entire sandbox directory $SANDBOX_HOME"
+  rm -rfv "$SANDBOX_HOME"
+}
+
+_purge(){
+  if [[ -d "$SANDBOX_HOME" ]]; then
+    # Stop all running instances by stopping each instance directory
+    for instance_dir in "$SANDBOX_HOME"/instances/*/; do
+      if [[ -d "$instance_dir" ]]; then
+        INSTANCE_HOME="$instance_dir"   # temporarily override
+        _stop
+      fi
+    done
+    # Reset to original (unused further)
+    INSTANCE_HOME="$SANDBOX_HOME/instances/$INSTANCE_ID"
+    delete_sandbox_dir
+  fi
 }
 
 #--------------------------------------------------------------------------------
