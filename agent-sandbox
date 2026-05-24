@@ -16,7 +16,7 @@ Usage:
 
 Run options:
   --agent <agent>            Agent to run (opencode, claude, qwen, ssh). Default: opencode
-  --model <model>            Model to use. Default: standard
+  --model <model>            Model to use. Default: code
   --context-size <size>      Maximum context window for opencode (half for output limit). Default: 124000
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
@@ -106,7 +106,7 @@ VM_AGENT_WORKDIR="/home/$VM_AGENT_USER/workdir"
 
 # Default agent / model
 CMD_DEFAULT_RUN_AGENT="opencode"
-CMD_DEFAULT_RUN_LOCAL_MODEL="standard"
+CMD_DEFAULT_RUN_LOCAL_MODEL="code"
 
 #--------------------------------------------------------------------------------
 # MAIN
