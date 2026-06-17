@@ -629,7 +629,6 @@ start_qemu() {
     -drive "if=pflash,format=raw,file=$OVMF_VARS_COPY" \
     \
     -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
-    -drive "file=$SEED_ISO,format=raw" \
     \
     -device "virtio-net-pci,netdev=host" \
     -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT" \
