@@ -96,7 +96,7 @@ AGENT_ALIVE="$INSTANCE_HOME/agent.alive"
 
 # VM internals
 VM_NAME="agent-sandbox-$INSTANCE_ID"
-VM_DISK_SIZE="10G"
+VM_DISK_SIZE="20G"
 VM_MEMORY_RAM="4G"
 VM_THREADS=$(( $(nproc 2>/dev/null || echo 4) * 80 / 100 ))
 [[ "$VM_THREADS" -lt 1 ]] && VM_THREADS=4
@@ -298,6 +298,7 @@ ensure_global_dirs() {
 
 ensure_instance_dirs() {
   mkdir -p "$INSTANCE_HOME"
+  echo -n "$WORKDIR" > "$INSTANCE_HOME/.instance_path"
 }
 
 ensure_uefi() {
@@ -875,15 +876,99 @@ _sync(){
 # STATUS (current instance)
 #--------------------------------------------------------------------------------
 
-get_status() {
-  find "$INSTANCE_HOME" -name '*.pid' | sort | while read pidfile; do
-    local pname="$(echo "$pidfile" | awk -F/ '{print $NF}' | awk -F. '{print $1}')"
-    echo "$pname pid: $(cat "$pidfile" 2>/dev/null || echo stopped)"
+get_pids() {
+  local instance_dir="$1"
+  local pid_list=""
+  for pidfile in "$instance_dir"/*.pid; do
+    if [[ -f "$pidfile" ]]; then
+      local pname="$(basename "$pidfile" .pid)"
+      local pid="$(cat "$pidfile" 2>/dev/null || echo stopped)"
+      if [[ -n "$pid_list" ]]; then
+        pid_list="$pid_list, "
+      fi
+      pid_list="${pid_list}${pname}:${pid}"
+    fi
   done
+  echo "$pid_list"
+}
+
+is_session_active() {
+  local instance_dir="$1"
+  local has_active=0
+  for pidfile in "$instance_dir"/*.pid; do
+    if [[ -f "$pidfile" ]]; then
+      local pid="$(cat "$pidfile" 2>/dev/null)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        has_active=1
+        break
+      fi
+    fi
+  done
+  return $((1 - has_active))
 }
 
 _status(){
-  get_status
+  if [[ ! -d "$SANDBOX_HOME/instances" ]]; then
+    echo "No sessions found."
+    return
+  fi
+
+  local found=0
+  local max_id_len=7
+  local -a lines=()
+
+  for instance_dir in "$SANDBOX_HOME"/instances/*/; do
+    if [[ ! -d "$instance_dir" ]]; then
+      continue
+    fi
+    found=1
+    local session_id="$(basename "$instance_dir")"
+    local instance_path=""
+    if [[ -f "$instance_dir/.instance_path" ]]; then
+      instance_path="$(cat "$instance_dir/.instance_path")"
+    else
+      instance_path="(unknown)"
+    fi
+    local pids
+    pids="$(get_pids "$instance_dir")"
+    if [[ ${#session_id} -gt $max_id_len ]]; then max_id_len=${#session_id}; fi
+    lines+=("$session_id|$instance_path|$pids|$instance_dir")
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "No sessions found."
+    return
+  fi
+
+  printf "\n"
+  printf "%-${max_id_len}s  %-4s  %-40s  %s\n" "SESSION" "STATUS" "PATH" "PIDS"
+  local sep_id sep_status sep_path sep_pids
+  sep_id="$(printf '%*s' "$max_id_len" '' | tr ' ' '-')"
+  sep_status="$(printf '%*s' 4 '' | tr ' ' '-')"
+  sep_path="$(printf '%*s' 40 '' | tr ' ' '-')"
+  sep_pids="$(printf '%*s' 40 '' | tr ' ' '-')"
+  printf "%s  %s  %s  %s\n" "$sep_id" "$sep_status" "$sep_path" "$sep_pids"
+
+  for line in "${lines[@]}"; do
+    local session_id="${line%%|*}"
+    local rest="${line#*|}"
+    local display_path="${rest%%|*}"
+    rest="${rest#*|}"
+    local pids="${rest%%|*}"
+    local instance_dir="${rest##*|}"
+
+    local status_display
+    if is_session_active "$instance_dir"; then
+      status_display="on"
+    else
+      status_display="off"
+    fi
+
+    local pid_display="${pids:--}"
+    printf "%-${max_id_len}s  %-4s  %-40s  %s\n" "$session_id" "$status_display" "$display_path" "$pid_display"
+  done
+
+  printf "\n"
 }
 
 #--------------------------------------------------------------------------------
