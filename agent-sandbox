@@ -478,7 +478,7 @@ build_golden_image() {
 
 _build() {
   local extra_cmd="${1:-}"
-  _clean
+  _purge
   ensure_prereqs
   download_base_image
   create_cloud_init "$extra_cmd"
@@ -1034,6 +1034,7 @@ _purge(){
     INSTANCE_HOME="$SANDBOX_HOME/instances/$INSTANCE_ID"
     delete_sandbox_dir
   fi
+  sleep 3
 }
 
 #--------------------------------------------------------------------------------
