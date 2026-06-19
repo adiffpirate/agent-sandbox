@@ -6,7 +6,7 @@ usage() {
 Usage:
   agent-sandbox run [--agent <agent>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] (requires prior 'build')
   agent-sandbox ssh <user> <command>
-  agent-sandbox build [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>]
+  agent-sandbox build <extra_command>
   agent-sandbox sync docker [filter_regex]
   agent-sandbox sync file <host_path>[:<vm_path>]
   agent-sandbox status
@@ -122,30 +122,8 @@ main() {
 
   case "$subcommand" in
     build)
-      local agent="$CMD_DEFAULT_RUN_AGENT"
-      local model="$CMD_DEFAULT_RUN_LOCAL_MODEL"
-      local vm_memory="$VM_MEMORY_RAM"
-      local vm_threads="$VM_THREADS"
-      local local_llm_host="$LOCAL_LLM_HOST"
-      local local_llm_server_port="$LOCAL_LLM_SERVER_PORT"
-
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --agent) agent="$2"; shift 2 ;;
-          --model) model="$2"; shift 2 ;;
-          --vm-memory) vm_memory="$2"; shift 2 ;;
-          --vm-threads) vm_threads="$2"; shift 2 ;;
-          --local-llm-host) local_llm_host="$2"; shift 2 ;;
-          --local-llm-port) local_llm_server_port="$2"; shift 2 ;;
-          *) usage ;;
-        esac
-      done
-
-      VM_MEMORY_RAM="$vm_memory"
-      VM_THREADS="$vm_threads"
-      LOCAL_LLM_HOST="$local_llm_host"
-      LOCAL_LLM_SERVER_PORT="$local_llm_server_port"
-      _build "$agent" "$model"
+      local cmd="${*:-echo}"
+      _build "$cmd"
       ;;
     run)
       local agent="$CMD_DEFAULT_RUN_AGENT"
@@ -331,7 +309,7 @@ download_base_image() {
 }
 
 create_cloud_init() {
-  local extra_cmd="${1:-echo}"
+  local extra_cmd="$1"
 
   local custom_ca_config=""
   if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
@@ -477,7 +455,7 @@ build_golden_image() {
 }
 
 _build() {
-  local extra_cmd="${1:-}"
+  local extra_cmd="$1"
   _purge
   ensure_prereqs
   download_base_image
