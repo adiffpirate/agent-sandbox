@@ -15,7 +15,7 @@ Usage:
   agent-sandbox purge
 
 Run options:
-  --agent <agent>            Agent to run (opencode, claude, qwen, ssh). Default: opencode
+  --agent <agent>            Agent to run (opencode, claude, qwen, ssh). Default: opencode (web mode)
   --model <model>            Model to use. Default: code
   --context-size <size>      Maximum context window for opencode (half for output limit). Default: 124000
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
@@ -93,6 +93,9 @@ REGISTRY_PIDFILE="$INSTANCE_HOME/registry.pid"
 REGISTRY_LOG="$INSTANCE_HOME/registry.log"
 REGISTRY_DIR="$INSTANCE_HOME/registry"
 AGENT_ALIVE="$INSTANCE_HOME/agent.alive"
+
+# OpenCode web
+OPENCODE_WEB_PORT=$((9090 + INSTANCE_PORT_OFFSET))
 
 # VM internals
 VM_NAME="agent-sandbox-$INSTANCE_ID"
@@ -208,7 +211,7 @@ virtiofsd_bin() {
 
 is_running(){
   local daemon=$1
-  _status | grep "$daemon" | grep --invert-match --quiet --ignore-case 'stopped'
+  _status | grep "$INSTANCE_ID" | grep -q "$daemon"
 }
 
 #--------------------------------------------------------------------------------
@@ -346,6 +349,8 @@ runcmd:
   # Install agent: opencode
   - npm install -g opencode-linux-x64-musl
   - ln -s /usr/local/lib/node_modules/opencode-linux-x64-musl/bin/opencode /usr/local/bin/opencode
+  # Dummy xdg-open for headless VM (opencode web tries to open browser)
+  - printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/xdg-open && chmod +x /usr/local/bin/xdg-open
   # Install agent: qwen
   - npm install -g @qwen-code/qwen-code@latest
   # Install agent: claude
@@ -610,7 +615,7 @@ start_qemu() {
     -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
     \
     -device "virtio-net-pci,netdev=host" \
-    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT" \
+    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_WEB_PORT-:$OPENCODE_WEB_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT" \
     \
     -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
     -numa "node,memdev=mem" \
@@ -688,8 +693,9 @@ run_agent(){
           }
         }
       }' > ~/.config/opencode/opencode.json
-      && opencode $continue_session
+      && opencode web --port $OPENCODE_WEB_PORT --hostname 0.0.0.0
     "
+      # && opencode web --port $OPENCODE_WEB_PORT --hostname 0.0.0.0
   elif [[ $agent == "claude" ]]; then
     _ssh $VM_AGENT_USER "
       export ANTHROPIC_BASE_URL='http://10.0.2.100:11434'
