@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<EOF
 Usage:
-  agent-sandbox run [--agent <agent>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] (requires prior 'build')
+  agent-sandbox run [--agent <agent>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro] (requires prior 'build')
   agent-sandbox ssh <user> <command>
   agent-sandbox build <extra_command>
   agent-sandbox sync docker [filter_regex]
@@ -20,15 +20,25 @@ Run options:
   --context-size <size>      Maximum context window for opencode (half for output limit). Default: 124000
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
-  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.10
-  --local-llm-port <port>    Host port for LLM proxy. Default: 11434
+  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.210
+  --local-llm-port <port>    Host port for LLM proxy. Default: 8080
   --restrict-network on|off  Restrict VM network. Default: on
+  --dns-whitelist <domains>  Comma-separated list of allowed domains.
+                             When provided with --restrict-network on, enables fine-grained
+                             DNS whitelist firewall (nftables + cgroup). Without it,
+                             --restrict-network on simply blocks all external traffic.
+                             Subdomain matching is automatic: "github.com" allows "api.github.com".
+                             Example: --dns-whitelist github.com,npmjs.org,pypi.org
+  --workdir-ro               Mount workdir as read-only in the VM
+
+  NOTE: Running 'run' on an already-active instance will stop and restart it
+        with the new flags (useful for toggling --workdir-ro, --dns-whitelist, etc).
 
 Build options:
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
-  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.10
-  --local-llm-port <port>    Host port for LLM proxy. Default: 11434
+  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.210
+  --local-llm-port <port>    Host port for LLM proxy. Default: 8080
 EOF
   exit 1
 }
@@ -45,39 +55,31 @@ USER_DATA="$SANDBOX_HOME/user-data"
 META_DATA="$SANDBOX_HOME/meta-data"
 SSH_KEY="$SANDBOX_HOME/agent-sandbox_ed25519"
 SSH_PUB="$SSH_KEY.pub"
-OVMF_CODE_COPY="$SANDBOX_HOME/OVMF_CODE.fd"       # read‑only, shared
+OVMF_CODE_COPY="$SANDBOX_HOME/OVMF_CODE.fd"
 DOWNLOAD_IMAGE="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
-OVMF_CODE_SOURCE="/usr/share/OVMF/OVMF_CODE_4M.fd"
-OVMF_VARS_SOURCE="/usr/share/OVMF/OVMF_VARS_4M.fd"
+OVMF_CODE_SOURCE="/usr/share/ovmf/OVMF.fd"
+OVMF_VARS_SOURCE="/usr/share/ovmf/OVMF.fd"
 
-# Workdir of the caller – determines the instance
 WORKDIR="$(pwd)"
 
 #--------------------------------------------------------------------------------
 # PER‑INSTANCE VARIABLES
 #--------------------------------------------------------------------------------
 
-# Unique instance ID derived from the absolute path of WORKDIR
 INSTANCE_ID="inst-$(echo -n "$WORKDIR" | sha256sum | head -c 8)"
 INSTANCE_HOME="$SANDBOX_HOME/instances/$INSTANCE_ID"
 
-# Port offset avoids clashes between concurrent instances
 INSTANCE_PORT_OFFSET=$(( 16#$(echo -n "$INSTANCE_ID" | md5sum | head -c 4) % 1000 ))
 
-# SSH forwarding
 SSH_PORT=$((2222 + INSTANCE_PORT_OFFSET))
 
-# Haproxy (LLM proxy) – listen port on host
 HAPROXY_LISTEN_PORT=$((11434 + INSTANCE_PORT_OFFSET))
-# Actual LLM server address (destination for haproxy)
-LOCAL_LLM_HOST="192.168.0.10"
-LOCAL_LLM_SERVER_PORT="11434"
+LOCAL_LLM_HOST="192.168.0.210"
+LOCAL_LLM_SERVER_PORT="8080"
 
-# Registry
 REGISTRY_LISTEN_PORT=$((5000 + INSTANCE_PORT_OFFSET))
-REGISTRY_ENDPOINT="10.0.2.100:5000"                 # always 5000 inside the VM
+REGISTRY_ENDPOINT="10.0.2.100:5000"
 
-# Instance‑specific disk / runtime files
 SESSION_IMAGE="$INSTANCE_HOME/vm-session-disk.qcow2"
 OVMF_VARS_COPY="$INSTANCE_HOME/OVMF_VARS.fd"
 FS_SOCK="$INSTANCE_HOME/virtiofsd.sock"
@@ -94,7 +96,20 @@ REGISTRY_LOG="$INSTANCE_HOME/registry.log"
 REGISTRY_DIR="$INSTANCE_HOME/registry"
 AGENT_ALIVE="$INSTANCE_HOME/agent.alive"
 
-# OpenCode web
+# DNS filter (per-instance, optional)
+DNS_WHITELIST_INSTANCE="$INSTANCE_HOME/dns-whitelist.txt"
+DNS_FILTER_PORT=$((5353 + INSTANCE_PORT_OFFSET))
+DNS_FILTER_PIDFILE="$INSTANCE_HOME/dns-filter.pid"
+DNS_FILTER_LOG="$INSTANCE_HOME/dns-filter.log"
+DNS_FILTER_SCRIPT="$INSTANCE_HOME/dns_filter.py"
+
+# Cgroup for QEMU (network firewall isolation)
+CGROUP_NAME="agent_sandbox_${INSTANCE_ID}"
+CGROUP_DIR="/sys/fs/cgroup/$CGROUP_NAME"
+
+# nftables table name
+NFT_TABLE="agent_sandbox_${INSTANCE_ID}"
+
 OPENCODE_WEB_PORT=$((9090 + INSTANCE_PORT_OFFSET))
 
 # VM internals
@@ -104,10 +119,10 @@ VM_MEMORY_RAM="4G"
 VM_THREADS=$(( $(nproc 2>/dev/null || echo 4) * 80 / 100 ))
 [[ "$VM_THREADS" -lt 1 ]] && VM_THREADS=4
 VM_RESTRICT_NETWORK="on"
+VM_WORKDIR_RO="off"
 VM_AGENT_USER="agent"
 VM_AGENT_WORKDIR="/home/$VM_AGENT_USER/workdir"
 
-# Default agent / model
 CMD_DEFAULT_RUN_AGENT="opencode"
 CMD_DEFAULT_RUN_LOCAL_MODEL="code"
 
@@ -137,6 +152,8 @@ main() {
       local local_llm_server_port="$LOCAL_LLM_SERVER_PORT"
       local context_size=124000
       local restrict_network="$VM_RESTRICT_NETWORK"
+      local workdir_ro="$VM_WORKDIR_RO"
+      local dns_whitelist=""
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -148,6 +165,8 @@ main() {
           --local-llm-host) local_llm_host="$2"; shift 2 ;;
           --local-llm-port) local_llm_server_port="$2"; shift 2 ;;
           --restrict-network) restrict_network="$2"; shift 2 ;;
+          --workdir-ro) workdir_ro="on"; shift ;;
+          --dns-whitelist) dns_whitelist="$2"; shift 2 ;;
           *) usage ;;
         esac
       done
@@ -157,7 +176,8 @@ main() {
       LOCAL_LLM_HOST="$local_llm_host"
       LOCAL_LLM_SERVER_PORT="$local_llm_server_port"
       VM_RESTRICT_NETWORK="$restrict_network"
-      _run "$agent" "$model" "$context_size"
+      VM_WORKDIR_RO="$workdir_ro"
+      _run "$agent" "$model" "$context_size" "$dns_whitelist"
       ;;
     ssh)
       local user="${1:-$VM_AGENT_USER}"
@@ -229,7 +249,7 @@ ensure_prereqs() {
 ensure_packages() {
   local missing=0
 
-  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "registry" "socat"; do
+  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "registry" "socat" "rsync" "nft" "python3"; do
     if ! have_cmd "$c"; then
       echo "Missing command: $c" >&2
       missing=1
@@ -259,7 +279,7 @@ ensure_packages() {
   if [[ "$missing" -ne 0 ]]; then
     cat >&2 <<'EOF'
 Install prerequisites:
-  sudo apt install -y curl pwgen openssh-client genisoimage qemu-kvm qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy socat
+  sudo apt install -y curl pwgen openssh-client genisoimage qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy socat rsync nftables python3
   curl -L https://github.com/distribution/distribution/releases/download/v3.1.0/registry_3.1.0_linux_amd64.tar.gz -o /tmp/registry.tar.gz
   tar -xzf /tmp/registry.tar.gz -C "/tmp" && sudo mv /tmp/registry /usr/local/bin/registry && sudo chmod +x /usr/local/bin/registry
 
@@ -283,11 +303,9 @@ ensure_instance_dirs() {
 }
 
 ensure_uefi() {
-  # Shared OVMF_CODE copy
   if [[ ! -f "$OVMF_CODE_COPY" ]]; then
     cp "$OVMF_CODE_SOURCE" "$OVMF_CODE_COPY"
   fi
-  # Per‑instance OVMF_VARS copy
   if [[ ! -f "$OVMF_VARS_COPY" ]]; then
     cp "$OVMF_VARS_SOURCE" "$OVMF_VARS_COPY"
   fi
@@ -486,13 +504,22 @@ start_virtiofsd() {
     return
   fi
 
+  rm -f "$FS_SOCK"
+
   echo "Starting virtiofsd..."
+  local ro_flag=""
+  if [[ "$VM_WORKDIR_RO" == "on" ]]; then
+    ro_flag="--readonly"
+    echo "  (workdir mounted read-only)"
+  fi
+
   nohup $(virtiofsd_bin) \
     --socket-path="$FS_SOCK" \
     --shared-dir="$WORKDIR" \
     --sandbox namespace \
     --uid-map=:1001:$(id -u):1: \
     --gid-map=:1002:$(id -g):1: \
+    $ro_flag \
     >"$VIRTIOFSD_LOG" 2>&1 &
 
   local tries=50
@@ -595,6 +622,284 @@ EOF
   done
 }
 
+#--------------------------------------------------------------------------------
+# DNS FILTER (per-instance, optional, host-level, VM cannot access or modify)
+#--------------------------------------------------------------------------------
+
+install_dns_whitelist() {
+  local csv="$1"
+
+  local -a domains=()
+  IFS=',' read -ra domains <<< "$csv"
+
+  {
+    for d in "${domains[@]}"; do
+      local trimmed
+      trimmed="$(echo "$d" | tr -d '[:space:]')"
+      [[ -n "$trimmed" ]] && echo "$trimmed"
+    done
+  } > "$DNS_WHITELIST_INSTANCE"
+
+  chmod 444 "$DNS_WHITELIST_INSTANCE"
+
+  local count
+  count=$(wc -l < "$DNS_WHITELIST_INSTANCE")
+  echo "  DNS whitelist: $count domain(s)"
+}
+
+start_dns_filter() {
+  if [[ -f "$DNS_FILTER_PIDFILE" ]] && kill -0 "$(cat "$DNS_FILTER_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    echo "DNS filter already running, skipping"
+    return
+  fi
+
+  if [[ ! -f "$DNS_WHITELIST_INSTANCE" ]]; then
+    return  # No whitelist, no filter needed
+  fi
+
+  echo "Starting DNS filter on 127.0.0.1:$DNS_FILTER_PORT..."
+
+  cat > "$DNS_FILTER_SCRIPT" <<'PYEOF'
+#!/usr/bin/env python3
+"""Per-instance DNS Whitelist Filter. Binds to 127.0.0.1 (unreachable from VM)."""
+import socket, struct, sys, threading
+
+WHITELIST_FILE = sys.argv[1]
+BIND_PORT = int(sys.argv[2])
+UPSTREAM_DNS = "8.8.8.8"
+
+def load_whitelist():
+    domains = set()
+    try:
+        with open(WHITELIST_FILE) as f:
+            for line in f:
+                line = line.strip().lower().rstrip('.')
+                if line and not line.startswith('#'):
+                    domains.add(line)
+    except FileNotFoundError:
+        pass
+    return domains
+
+def is_allowed(domain):
+    domain = domain.lower().rstrip('.')
+    if not domain:
+        return False
+    domains = load_whitelist()
+    if domain in domains:
+        return True
+    parts = domain.split('.')
+    for i in range(1, len(parts)):
+        if '.'.join(parts[i:]) in domains:
+            return True
+    return False
+
+def extract_qname(data):
+    try:
+        idx = 12
+        labels = []
+        while idx < len(data):
+            length = data[idx]
+            if length == 0:
+                break
+            idx += 1
+            if length > 63:
+                return None
+            labels.append(data[idx:idx+length].decode('ascii', errors='ignore'))
+            idx += length
+        return '.'.join(labels) if labels else None
+    except Exception:
+        return None
+
+def build_nxdomain_response(query_data):
+    try:
+        txn_id = query_data[0:2]
+        flags = bytes([0x81, 0x83])
+        counts = b'\x00\x01\x00\x00\x00\x00\x00\x00'
+        question = query_data[12:]
+        return txn_id + flags + counts + question
+    except Exception:
+        return None
+
+def handle_dns(data):
+    domain = extract_qname(data)
+    if domain is None:
+        return None
+    if is_allowed(domain):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(5)
+            s.sendto(data, (UPSTREAM_DNS, 53))
+            resp, _ = s.recvfrom(4096)
+            s.close()
+            return resp
+        except Exception:
+            pass
+        return None
+    return build_nxdomain_response(data)
+
+def udp_server():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('127.0.0.1', BIND_PORT))
+    while True:
+        data, addr = sock.recvfrom(4096)
+        resp = handle_dns(data)
+        if resp:
+            sock.sendto(resp, addr)
+
+def tcp_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', BIND_PORT))
+    srv.listen(5)
+    while True:
+        conn, _ = srv.accept()
+        try:
+            hd = conn.recv(2)
+            if len(hd) < 2:
+                continue
+            n = struct.unpack('>H', hd)[0]
+            data = b''
+            while len(data) < n:
+                chunk = conn.recv(n - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            resp = handle_dns(data)
+            if resp:
+                conn.sendall(struct.pack('>H', len(resp)) + resp)
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+def main():
+    n = len(load_whitelist())
+    print(f"DNS filter on 127.0.0.1:{BIND_PORT} | whitelist={n} domains | upstream={UPSTREAM_DNS}")
+    threading.Thread(target=tcp_server, daemon=True).start()
+    udp_server()
+
+if __name__ == '__main__':
+    main()
+PYEOF
+
+  nohup python3 "$DNS_FILTER_SCRIPT" "$DNS_WHITELIST_INSTANCE" "$DNS_FILTER_PORT" > "$DNS_FILTER_LOG" 2>&1 &
+  local pid=$!
+  echo $pid > "$DNS_FILTER_PIDFILE"
+
+  sleep 0.5
+  if ! kill -0 $pid 2>/dev/null; then
+    echo "ERROR: DNS filter failed to start. See $DNS_FILTER_LOG" >&2
+    cat "$DNS_FILTER_LOG" >&2
+    exit 1
+  fi
+}
+
+#--------------------------------------------------------------------------------
+# NETWORK FIREWALL (nftables + cgroup v2, only active when whitelist is set)
+#--------------------------------------------------------------------------------
+
+setup_network_firewall() {
+  local qemu_pid="$1"
+
+  # Only activate when restrict is on AND a whitelist exists
+  if [[ "$VM_RESTRICT_NETWORK" != "on" ]]; then
+    return
+  fi
+  if [[ ! -f "$DNS_WHITELIST_INSTANCE" ]]; then
+    echo "  No DNS whitelist set, using SLIRP restrict only (no external network)"
+    return
+  fi
+
+  echo "  Setting up DNS whitelist firewall..."
+
+  if [[ ! -d "$CGROUP_DIR" ]]; then
+    mkdir -p "$CGROUP_DIR"
+  fi
+
+  local cgroup_id
+  cgroup_id=$(stat -c %i "$CGROUP_DIR")
+
+  echo "$qemu_pid" > "$CGROUP_DIR/cgroup.procs"
+
+  echo "  Resolving whitelist domains..."
+  local whitelist_ips=()
+  while IFS= read -r domain; do
+    [[ "$domain" =~ ^[[:space:]]*# ]] && continue
+    [[ "$domain" =~ ^[[:space:]]*$ ]] && continue
+    domain="$(echo "$domain" | tr -d '[:space:]')"
+    [[ -z "$domain" ]] && continue
+    local ips
+    ips=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -z "$ips" ]] && have_cmd dig; then
+      ips=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    fi
+    for ip in $ips; do
+      [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && whitelist_ips+=("$ip")
+    done
+  done < "$DNS_WHITELIST_INSTANCE"
+
+  local unique_ips=()
+  if [[ ${#whitelist_ips[@]} -gt 0 ]]; then
+    unique_ips=($(printf '%s\n' "${whitelist_ips[@]}" | sort -u))
+  fi
+  echo "  Resolved to ${#unique_ips[@]} unique IP(s)"
+
+  local nft_rules="/tmp/.nft_${CGROUP_NAME}.rules"
+  cat > "$nft_rules" <<NFT
+flush table ip $NFT_TABLE;
+table ip $NFT_TABLE;
+
+chain nat_out {
+  type nat hook output priority 100;
+  meta cgroup v2 $cgroup_id udp dport 53 dnat to 127.0.0.1:$DNS_FILTER_PORT;
+  meta cgroup v2 $cgroup_id tcp dport 53 dnat to 127.0.0.1:$DNS_FILTER_PORT;
+}
+
+chain filter_out {
+  type filter hook output priority 0; policy accept;
+  meta cgroup v2 $cgroup_id ct state established accept;
+  meta cgroup v2 $cgroup_id ct state related accept;
+  meta cgroup v2 $cgroup_id ct state invalid drop;
+  meta cgroup v2 $cgroup_id ip daddr 127.0.0.1 accept;
+NFT
+
+  for ip in "${unique_ips[@]}"; do
+    echo "  meta cgroup v2 $cgroup_id ip daddr $ip accept;" >> "$nft_rules"
+  done
+
+  cat >> "$nft_rules" <<NFT
+  meta cgroup v2 $cgroup_id ip protocol tcp drop;
+  meta cgroup v2 $cgroup_id ip protocol udp drop;
+}
+NFT
+
+  if ! nft -f "$nft_rules" 2>"$INSTANCE_HOME/nft_errors.log"; then
+    echo "  WARNING: nftables rules failed. See $INSTANCE_HOME/nft_errors.log" >&2
+    cat "$INSTANCE_HOME/nft_errors.log" >&2
+  else
+    echo "  Firewall active: only whitelist + localhost reachable from VM"
+  fi
+
+  rm -f "$nft_rules"
+}
+
+teardown_network_firewall() {
+  if have_cmd nft; then
+    nft flush table ip "$NFT_TABLE" 2>/dev/null || true
+    nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+  fi
+  if [[ -d "$CGROUP_DIR" ]]; then
+    sleep 1
+    rmdir "$CGROUP_DIR" 2>/dev/null || true
+    rmdir "$(dirname "$CGROUP_DIR")" 2>/dev/null || true
+  fi
+}
+
+#--------------------------------------------------------------------------------
+# QEMU
+#--------------------------------------------------------------------------------
+
 start_qemu() {
   if is_running qemu; then
     echo "VM already running, skipping"
@@ -602,6 +907,11 @@ start_qemu() {
   fi
 
   echo "Starting QEMU/KVM..."
+
+  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$DNS_WHITELIST_INSTANCE" ]]; then
+    mkdir -p "$CGROUP_DIR"
+  fi
+
   qemu-system-x86_64 \
     -name "$VM_NAME" \
     --enable-kvm \
@@ -621,6 +931,13 @@ start_qemu() {
     -numa "node,memdev=mem" \
     -chardev "socket,id=fs0,path=$FS_SOCK" \
     -device "vhost-user-fs-pci,chardev=fs0,tag=workdir"
+
+  local qemu_pid
+  qemu_pid=$(cat "$QEMU_PIDFILE" 2>/dev/null || echo "")
+
+  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -n "$qemu_pid" ]] && [[ -f "$DNS_WHITELIST_INSTANCE" ]]; then
+    setup_network_firewall "$qemu_pid"
+  fi
 }
 
 wait_for_ssh() {
@@ -640,11 +957,18 @@ wait_for_ssh() {
 }
 
 mount_workdir() {
-    echo 'Binding current directory with VM'
+    local mount_opts=""
+    if [[ "$VM_WORKDIR_RO" == "on" ]]; then
+      mount_opts="-o ro"
+      echo 'Binding current directory with VM (read-only)'
+    else
+      echo 'Binding current directory with VM'
+    fi
+
     _ssh root "
       mkdir -p $VM_AGENT_WORKDIR \
       && modprobe virtiofs 2>/dev/null || true \
-      && mount -t virtiofs workdir $VM_AGENT_WORKDIR
+      && mount $mount_opts -t virtiofs workdir $VM_AGENT_WORKDIR
     "
 }
 
@@ -666,7 +990,8 @@ run_agent(){
   local model=$2
   local context_size=$3
 
-  local continue_session="$(if [[ -f "$AGENT_ALIVE" ]]; then echo '--continue'; fi)"
+  local continue_session=""
+  [[ -f "$AGENT_ALIVE" ]] && continue_session="--continue"
 
   if [[ $agent == "opencode" ]]; then
     _ssh $VM_AGENT_USER "
@@ -699,7 +1024,6 @@ run_agent(){
       }' > ~/.config/opencode/opencode.json
       && opencode web --port $OPENCODE_WEB_PORT --hostname 0.0.0.0
     "
-      # && opencode web --port $OPENCODE_WEB_PORT --hostname 0.0.0.0
   elif [[ $agent == "claude" ]]; then
     _ssh $VM_AGENT_USER "
       export ANTHROPIC_BASE_URL='http://10.0.2.100:11434'
@@ -748,10 +1072,25 @@ run_agent(){
   touch "$AGENT_ALIVE"
 }
 
+#--------------------------------------------------------------------------------
+# _run: orchestrates full startup (with restart-if-running logic)
+#--------------------------------------------------------------------------------
+
 _run(){
   local agent="${1:-$CMD_DEFAULT_RUN_AGENT}"
   local model="${2:-$CMD_DEFAULT_RUN_LOCAL_MODEL}"
   local context_size="${3:-124000}"
+  local dns_whitelist_csv="${4:-}"
+
+  # Restart if already running
+  if is_running qemu; then
+    echo "============================================================"
+    echo " Instance $INSTANCE_ID already running."
+    echo " Stopping and restarting with updated settings..."
+    echo "============================================================"
+    _stop
+    sleep 2
+  fi
 
   if [[ ! -f "$GOLDEN_IMAGE" ]]; then
     echo "ERROR: Golden image not found. Run 'agent-sandbox build' first."
@@ -760,9 +1099,18 @@ _run(){
 
   ensure_prereqs
   create_session_overlay
+
+  # Install per-instance DNS whitelist (optional)
+  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -n "$dns_whitelist_csv" ]]; then
+    install_dns_whitelist "$dns_whitelist_csv"
+  fi
+
   start_virtiofsd
   start_haproxy
   start_registry
+  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$DNS_WHITELIST_INSTANCE" ]]; then
+    start_dns_filter
+  fi
   start_qemu
   wait_for_ssh
   mount_workdir
@@ -834,19 +1182,23 @@ sync_files() {
     exit 1
   fi
 
-  echo "Syncing $host_path -> $vm_path"
+  if [[ -d "$host_path" ]]; then
+    host_path="${host_path%/}/"
+  fi
+
+  echo "Syncing $host_path -> $vm_path (rsync incremental)"
   local vm_dir
   vm_dir=$(dirname "$vm_path")
-  _ssh $VM_AGENT_USER "mkdir -p '$vm_dir'"
+  _ssh root "mkdir -p '$vm_dir'"
 
-  scp -i "$SSH_KEY" -P "$SSH_PORT" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -r "$host_path" "${ssh_user}@127.0.0.1:$vm_path"
+  rsync -az --partial \
+    -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+    "$host_path" "${ssh_user}@127.0.0.1:${vm_path%/}"
 }
 
 _sync(){
   local sync_mode="$1"
-  local sync_arg="$2"
+  local sync_arg="${2:-}"
 
   if ! is_running qemu; then
     echo "ERROR: VM is not running. Unable to sync"
@@ -861,7 +1213,7 @@ _sync(){
 }
 
 #--------------------------------------------------------------------------------
-# STATUS (current instance)
+# STATUS
 #--------------------------------------------------------------------------------
 
 get_pids() {
@@ -871,9 +1223,7 @@ get_pids() {
     if [[ -f "$pidfile" ]]; then
       local pname="$(basename "$pidfile" .pid)"
       local pid="$(cat "$pidfile" 2>/dev/null || echo stopped)"
-      if [[ -n "$pid_list" ]]; then
-        pid_list="$pid_list, "
-      fi
+      [[ -n "$pid_list" ]] && pid_list="$pid_list, "
       pid_list="${pid_list}${pname}:${pid}"
     fi
   done
@@ -960,17 +1310,24 @@ _status(){
 }
 
 #--------------------------------------------------------------------------------
-# STOP (current instance)
+# STOP
 #--------------------------------------------------------------------------------
 
 stop_daemons() {
+  teardown_network_firewall
+
   find "$INSTANCE_HOME" -name '*.pid' | while read pidfile; do
-    echo "Stopping $pidfile"
-    kill "$(cat $pidfile)" 2>/dev/null || true
+    local pname
+    pname="$(basename "$pidfile" .pid)"
+    echo "Stopping $pname..."
+    kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
     rm -f "$pidfile"
     sleep 1
   done
+
   rm -f "$AGENT_ALIVE"
+  rm -f "$FS_SOCK"
+  rm -f "$INSTANCE_HOME/nft_errors.log"
 }
 
 _stop(){
@@ -980,7 +1337,7 @@ _stop(){
 }
 
 #--------------------------------------------------------------------------------
-# CLEAN (current instance)
+# CLEAN
 #--------------------------------------------------------------------------------
 
 clean_session_files() {
@@ -1001,7 +1358,7 @@ _clean(){
 }
 
 #--------------------------------------------------------------------------------
-# PURGE (everything)
+# PURGE
 #--------------------------------------------------------------------------------
 
 delete_sandbox_dir() {
@@ -1011,14 +1368,12 @@ delete_sandbox_dir() {
 
 _purge(){
   if [[ -d "$SANDBOX_HOME" ]]; then
-    # Stop all running instances by stopping each instance directory
     for instance_dir in "$SANDBOX_HOME"/instances/*/; do
       if [[ -d "$instance_dir" ]]; then
-        INSTANCE_HOME="$instance_dir"   # temporarily override
+        INSTANCE_HOME="$instance_dir"
         _stop
       fi
     done
-    # Reset to original (unused further)
     INSTANCE_HOME="$SANDBOX_HOME/instances/$INSTANCE_ID"
     delete_sandbox_dir
   fi
