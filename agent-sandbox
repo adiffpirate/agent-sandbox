@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  cat <<EOF
+  cat <<'USAGE_EOF'
 Usage:
   agent-sandbox run [--agent <agent>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro] (requires prior 'build')
   agent-sandbox ssh <user> <command>
@@ -25,8 +25,8 @@ Run options:
   --restrict-network on|off  Restrict VM network. Default: on
   --dns-whitelist <domains>  Comma-separated list of allowed domains.
                              When provided with --restrict-network on, enables fine-grained
-                             DNS whitelist firewall (nftables + cgroup). Without it,
-                             --restrict-network on simply blocks all external traffic.
+                             domain whitelist via in-VM transparent proxy + host CONNECT proxy.
+                             Without it, --restrict-network on simply blocks all external traffic.
                              Subdomain matching is automatic: "github.com" allows "api.github.com".
                              Example: --dns-whitelist github.com,npmjs.org,pypi.org
   --workdir-ro               Mount workdir as read-only in the VM
@@ -39,7 +39,7 @@ Build options:
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
   --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.210
   --local-llm-port <port>    Host port for LLM proxy. Default: 8080
-EOF
+USAGE_EOF
   exit 1
 }
 
@@ -63,7 +63,7 @@ OVMF_VARS_SOURCE="/usr/share/ovmf/OVMF.fd"
 WORKDIR="$(pwd)"
 
 #--------------------------------------------------------------------------------
-# PER‑INSTANCE VARIABLES
+# PER-INSTANCE VARIABLES
 #--------------------------------------------------------------------------------
 
 INSTANCE_ID="inst-$(echo -n "$WORKDIR" | sha256sum | head -c 8)"
@@ -96,19 +96,13 @@ REGISTRY_LOG="$INSTANCE_HOME/registry.log"
 REGISTRY_DIR="$INSTANCE_HOME/registry"
 AGENT_ALIVE="$INSTANCE_HOME/agent.alive"
 
-# DNS filter (per-instance, optional)
-DNS_WHITELIST_INSTANCE="$INSTANCE_HOME/dns-whitelist.txt"
-DNS_FILTER_PORT=$((5353 + INSTANCE_PORT_OFFSET))
-DNS_FILTER_PIDFILE="$INSTANCE_HOME/dns-filter.pid"
-DNS_FILTER_LOG="$INSTANCE_HOME/dns-filter.log"
-DNS_FILTER_SCRIPT="$INSTANCE_HOME/dns_filter.py"
-
-# Cgroup for QEMU (network firewall isolation)
-CGROUP_NAME="agent_sandbox_${INSTANCE_ID}"
-CGROUP_DIR="/sys/fs/cgroup/$CGROUP_NAME"
-
-# nftables table name
-NFT_TABLE="agent_sandbox_${INSTANCE_ID}"
+# Host-side proxy (handles HTTP/HTTPS + DNS, per-instance)
+HOST_PROXY_PORT=$((14000 + INSTANCE_PORT_OFFSET))
+HOST_PROXY_SCRIPT="$INSTANCE_HOME/host_proxy.py"
+HOST_PROXY_PIDFILE="$INSTANCE_HOME/host_proxy.pid"
+HOST_PROXY_LOG="$INSTANCE_HOME/host_proxy.log"
+# Whitelist
+WHITELIST_FILE="$INSTANCE_HOME/dns-whitelist.txt"
 
 OPENCODE_WEB_PORT=$((9090 + INSTANCE_PORT_OFFSET))
 
@@ -249,7 +243,7 @@ ensure_prereqs() {
 ensure_packages() {
   local missing=0
 
-  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "registry" "socat" "rsync" "nft" "python3"; do
+  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "registry" "socat" "rsync" "python3"; do
     if ! have_cmd "$c"; then
       echo "Missing command: $c" >&2
       missing=1
@@ -279,7 +273,7 @@ ensure_packages() {
   if [[ "$missing" -ne 0 ]]; then
     cat >&2 <<'EOF'
 Install prerequisites:
-  sudo apt install -y curl pwgen openssh-client genisoimage qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy socat rsync nftables python3
+  sudo apt install -y curl pwgen openssh-client genisoimage qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy socat rsync python3
   curl -L https://github.com/distribution/distribution/releases/download/v3.1.0/registry_3.1.0_linux_amd64.tar.gz -o /tmp/registry.tar.gz
   tar -xzf /tmp/registry.tar.gz -C "/tmp" && sudo mv /tmp/registry /usr/local/bin/registry && sudo chmod +x /usr/local/bin/registry
 
@@ -361,6 +355,7 @@ packages:
   - docker-cli
   - docker-cli-compose
   - containerd
+  - nftables
 
 runcmd:
   - set -xeo pipefail
@@ -488,7 +483,7 @@ _build() {
 }
 
 #--------------------------------------------------------------------------------
-# RUN (per‑instance)
+# RUN (per-instance)
 #--------------------------------------------------------------------------------
 
 create_session_overlay() {
@@ -623,10 +618,10 @@ EOF
 }
 
 #--------------------------------------------------------------------------------
-# DNS FILTER (per-instance, optional, host-level, VM cannot access or modify)
+# WHITELIST + HOST CONNECT PROXY (per-instance, optional)
 #--------------------------------------------------------------------------------
 
-install_dns_whitelist() {
+install_whitelist() {
   local csv="$1"
 
   local -a domains=()
@@ -638,34 +633,40 @@ install_dns_whitelist() {
       trimmed="$(echo "$d" | tr -d '[:space:]')"
       [[ -n "$trimmed" ]] && echo "$trimmed"
     done
-  } > "$DNS_WHITELIST_INSTANCE"
-
-  chmod 444 "$DNS_WHITELIST_INSTANCE"
+  } > "$WHITELIST_FILE"
 
   local count
-  count=$(wc -l < "$DNS_WHITELIST_INSTANCE")
-  echo "  DNS whitelist: $count domain(s)"
+  count=$(wc -l < "$WHITELIST_FILE")
+  echo "  Whitelist: $count domain(s)"
 }
 
-start_dns_filter() {
-  if [[ -f "$DNS_FILTER_PIDFILE" ]] && kill -0 "$(cat "$DNS_FILTER_PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    echo "DNS filter already running, skipping"
+start_host_proxy() {
+  if is_running host_proxy; then
+    echo "Host proxy already running, skipping"
     return
   fi
 
-  if [[ ! -f "$DNS_WHITELIST_INSTANCE" ]]; then
-    return  # No whitelist, no filter needed
+  if nc -z "127.0.0.1" $HOST_PROXY_PORT > /dev/null 2>&1; then
+    echo "ERROR: Port $HOST_PROXY_PORT already in use" >&2
+    exit 1
   fi
 
-  echo "Starting DNS filter on 127.0.0.1:$DNS_FILTER_PORT..."
+  echo "Starting host proxy on 127.0.0.1:$HOST_PROXY_PORT (HTTP/HTTPS + DNS)..."
 
-  cat > "$DNS_FILTER_SCRIPT" <<'PYEOF'
+  cat > "$HOST_PROXY_SCRIPT" <<'PYEOF'
 #!/usr/bin/env python3
-"""Per-instance DNS Whitelist Filter. Binds to 127.0.0.1 (unreachable from VM)."""
-import socket, struct, sys, threading
+"""Host-side whitelist proxy.
+Handles:
+  - HTTP/HTTPS: DNAT'd connections from VM. Reads SNI or Host header,
+    checks whitelist, tunnels to real server.
+  - DNS: connections prefixed with b"DNS" + length + query.
+    Forwards to upstream DNS, returns response.
+"""
+import socket, struct, threading, sys
 
-WHITELIST_FILE = sys.argv[1]
-BIND_PORT = int(sys.argv[2])
+BIND_ADDR = "127.0.0.1"
+BIND_PORT = int(sys.argv[1])
+WHITELIST_FILE = sys.argv[2]
 UPSTREAM_DNS = "8.8.8.8"
 
 def load_whitelist():
@@ -680,220 +681,313 @@ def load_whitelist():
         pass
     return domains
 
-def is_allowed(domain):
-    domain = domain.lower().rstrip('.')
-    if not domain:
+def is_allowed(hostname):
+    hostname = hostname.lower().rstrip('.')
+    if not hostname:
         return False
     domains = load_whitelist()
-    if domain in domains:
+    if hostname in domains:
         return True
-    parts = domain.split('.')
+    parts = hostname.split('.')
     for i in range(1, len(parts)):
         if '.'.join(parts[i:]) in domains:
             return True
     return False
 
-def extract_qname(data):
+def parse_sni(data):
     try:
-        idx = 12
-        labels = []
-        while idx < len(data):
-            length = data[idx]
-            if length == 0:
+        if len(data) < 5 or data[0] != 0x16:
+            return None
+        idx = 5
+        if idx + 4 > len(data): return None
+        idx += 4
+        if idx + 2 > len(data): return None
+        idx += 2
+        if idx + 32 > len(data): return None
+        idx += 32
+        if idx >= len(data): return None
+        sid_len = data[idx]
+        idx += 1 + sid_len
+        if idx + 2 > len(data): return None
+        cs_len = struct.unpack('>H', data[idx:idx+2])[0]
+        idx += 2 + cs_len
+        if idx >= len(data): return None
+        comp_len = data[idx]
+        idx += 1 + comp_len
+        if idx + 2 > len(data): return None
+        ext_total = struct.unpack('>H', data[idx:idx+2])[0]
+        idx += 2
+        ext_end = idx + ext_total
+        while idx + 4 <= ext_end:
+            ext_type = struct.unpack('>H', data[idx:idx+2])[0]
+            ext_len = struct.unpack('>H', data[idx+2:idx+4])[0]
+            idx += 4
+            if ext_type == 0x0000 and ext_len >= 5:
+                entry_idx = idx + 2
+                if entry_idx + 3 > idx + ext_len:
+                    return None
+                if data[entry_idx] != 0:
+                    return None
+                name_len = struct.unpack('>H', data[entry_idx+1:entry_idx+3])[0]
+                return data[entry_idx+3:entry_idx+3+name_len].decode('ascii', errors='ignore')
+            idx += ext_len
+        return None
+    except Exception:
+        return None
+
+def parse_host(data):
+    try:
+        text = data.decode('utf-8', errors='ignore')
+        for line in text.split('\r\n'):
+            s = line.strip()
+            if s.lower().startswith('host:'):
+                val = s[5:].strip()
+                if ':' in val:
+                    val = val.rsplit(':', 1)[0]
+                return val
+        return None
+    except Exception:
+        return None
+
+def udp_resolve(query):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(5)
+    try:
+        s.sendto(query, (UPSTREAM_DNS, 53))
+        resp, _ = s.recvfrom(4096)
+        return resp
+    finally:
+        s.close()
+
+def pump(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
                 break
-            idx += 1
-            if length > 63:
-                return None
-            labels.append(data[idx:idx+length].decode('ascii', errors='ignore'))
-            idx += length
-        return '.'.join(labels) if labels else None
-    except Exception:
-        return None
+            dst.sendall(data)
+    except (ConnectionResetError, BrokenPipeError, OSError):
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
-def build_nxdomain_response(query_data):
+def handle_dns(conn, data):
+    """DNS: data = b'DNS' + 2-byte-len + query (may need more reads)."""
     try:
-        txn_id = query_data[0:2]
-        flags = bytes([0x81, 0x83])
-        counts = b'\x00\x01\x00\x00\x00\x00\x00\x00'
-        question = query_data[12:]
-        return txn_id + flags + counts + question
+        payload = data[3:]
+        if len(payload) < 2:
+            return
+        msg_len = struct.unpack('>H', payload[:2])[0]
+        query = payload[2:2+msg_len]
+        while len(query) < msg_len:
+            chunk = conn.recv(msg_len - len(query))
+            if not chunk:
+                break
+            query += chunk
+        resp = udp_resolve(query)
+        conn.sendall(struct.pack('>H', len(resp)) + resp)
     except Exception:
-        return None
+        pass
+    finally:
+        conn.close()
 
-def handle_dns(data):
-    domain = extract_qname(data)
-    if domain is None:
-        return None
-    if is_allowed(domain):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(5)
-            s.sendto(data, (UPSTREAM_DNS, 53))
-            resp, _ = s.recvfrom(4096)
-            s.close()
-            return resp
-        except Exception:
-            pass
-        return None
-    return build_nxdomain_response(data)
-
-def udp_server():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('127.0.0.1', BIND_PORT))
-    while True:
-        data, addr = sock.recvfrom(4096)
-        resp = handle_dns(data)
-        if resp:
-            sock.sendto(resp, addr)
-
-def tcp_server():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('127.0.0.1', BIND_PORT))
-    srv.listen(5)
-    while True:
-        conn, _ = srv.accept()
-        try:
-            hd = conn.recv(2)
-            if len(hd) < 2:
-                continue
-            n = struct.unpack('>H', hd)[0]
-            data = b''
-            while len(data) < n:
-                chunk = conn.recv(n - len(data))
-                if not chunk:
+def handle_http_https(conn, data):
+    """HTTP/HTTPS: DNAT'd raw connection from VM."""
+    try:
+        # Read enough to identify protocol
+        while len(data) < 512:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            data += chunk
+            if data[0] == 0x16:
+                if len(data) >= 5:
+                    rl = struct.unpack('>H', data[3:5])[0]
+                    if len(data) >= 5 + rl:
+                        break
+            else:
+                if b'\r\n\r\n' in data:
                     break
-                data += chunk
-            resp = handle_dns(data)
-            if resp:
-                conn.sendall(struct.pack('>H', len(resp)) + resp)
-        except Exception:
-            pass
-        finally:
+
+        if data[0] == 0x16:
+            hostname = parse_sni(data)
+            port = 443
+        else:
+            hostname = parse_host(data)
+            port = 80
+
+        if not hostname:
             conn.close()
+            return
+
+        if not is_allowed(hostname):
+            conn.close()
+            return
+
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        upstream.settimeout(15)
+        upstream.connect((hostname, port))
+        upstream.settimeout(None)
+
+        # Forward original bytes to real server
+        upstream.sendall(data)
+
+        t = threading.Thread(target=pump, args=(conn, upstream), daemon=True)
+        t.start()
+        pump(upstream, conn)
+        t.join()
+        conn.close()
+        upstream.close()
+    except Exception:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+def handle_client(conn, addr):
+    try:
+        conn.settimeout(15)
+        data = conn.recv(4096)
+        if not data:
+            conn.close()
+            return
+        if data.startswith(b"DNS"):
+            handle_dns(conn, data)
+        else:
+            handle_http_https(conn, data)
+    except Exception:
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((BIND_ADDR, BIND_PORT))
+    sock.listen(128)
     n = len(load_whitelist())
-    print(f"DNS filter on 127.0.0.1:{BIND_PORT} | whitelist={n} domains | upstream={UPSTREAM_DNS}")
-    threading.Thread(target=tcp_server, daemon=True).start()
-    udp_server()
+    print(f"Host proxy on {BIND_ADDR}:{BIND_PORT} | {n} domains | HTTP/HTTPS+DNS", flush=True)
+    while True:
+        conn, addr = sock.accept()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
 if __name__ == '__main__':
     main()
 PYEOF
 
-  nohup python3 "$DNS_FILTER_SCRIPT" "$DNS_WHITELIST_INSTANCE" "$DNS_FILTER_PORT" > "$DNS_FILTER_LOG" 2>&1 &
+  nohup python3 "$HOST_PROXY_SCRIPT" "$HOST_PROXY_PORT" "$WHITELIST_FILE" > "$HOST_PROXY_LOG" 2>&1 &
   local pid=$!
-  echo $pid > "$DNS_FILTER_PIDFILE"
+  echo $pid > "$HOST_PROXY_PIDFILE"
 
   sleep 0.5
   if ! kill -0 $pid 2>/dev/null; then
-    echo "ERROR: DNS filter failed to start. See $DNS_FILTER_LOG" >&2
-    cat "$DNS_FILTER_LOG" >&2
+    echo "ERROR: Host proxy failed to start. See $HOST_PROXY_LOG" >&2
+    cat "$HOST_PROXY_LOG" >&2
     exit 1
   fi
+  echo "  Host proxy ready on 127.0.0.1:$HOST_PROXY_PORT"
 }
 
 #--------------------------------------------------------------------------------
-# NETWORK FIREWALL (nftables + cgroup v2, only active when whitelist is set)
+# VM FIREWALL (nftables REDIRECT + transparent proxy, runs inside VM via SSH)
 #--------------------------------------------------------------------------------
 
-setup_network_firewall() {
-  local qemu_pid="$1"
+setup_vm_firewall() {
+  echo "  Setting up in-VM firewall (nftables DNAT + DNS helper)..."
 
-  # Only activate when restrict is on AND a whitelist exists
-  if [[ "$VM_RESTRICT_NETWORK" != "on" ]]; then
-    return
-  fi
-  if [[ ! -f "$DNS_WHITELIST_INSTANCE" ]]; then
-    echo "  No DNS whitelist set, using SLIRP restrict only (no external network)"
-    return
-  fi
+  # Write the tiny DNS helper locally
+  cat > "$INSTANCE_HOME/dns_proxy.py" <<'DNSPROXY'
+#!/usr/bin/env python3
+"""In-VM DNS helper: UDP :53 -> TCP to host proxy (with DNS magic prefix)."""
+import socket, struct, threading, sys, os
 
-  echo "  Setting up DNS whitelist firewall..."
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 14000
 
-  if [[ ! -d "$CGROUP_DIR" ]]; then
-    mkdir -p "$CGROUP_DIR"
-  fi
+# Daemonize
+if os.fork() > 0:
+    sys.exit(0)
+os.setsid()
+if os.fork() > 0:
+    sys.exit(0)
 
-  local cgroup_id
-  cgroup_id=$(stat -c %i "$CGROUP_DIR")
+def fwd(q):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(("10.0.2.100", PORT))
+    s.sendall(b"DNS" + struct.pack(">H", len(q)) + q)
+    hdr = b""
+    while len(hdr) < 2:
+        hdr += s.recv(2 - len(hdr))
+    n = struct.unpack(">H", hdr)[0]
+    r = b""
+    while len(r) < n:
+        r += s.recv(n - len(r))
+    s.close()
+    return r
 
-  echo "$qemu_pid" > "$CGROUP_DIR/cgroup.procs"
+def h(sock, d, a):
+    try:
+        r = fwd(d)
+        if r:
+            sock.sendto(r, a)
+    except Exception:
+        pass
 
-  echo "  Resolving whitelist domains..."
-  local whitelist_ips=()
-  while IFS= read -r domain; do
-    [[ "$domain" =~ ^[[:space:]]*# ]] && continue
-    [[ "$domain" =~ ^[[:space:]]*$ ]] && continue
-    domain="$(echo "$domain" | tr -d '[:space:]')"
-    [[ -z "$domain" ]] && continue
-    local ips
-    ips=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' || true)
-    if [[ -z "$ips" ]] && have_cmd dig; then
-      ips=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
-    fi
-    for ip in $ips; do
-      [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && whitelist_ips+=("$ip")
-    done
-  done < "$DNS_WHITELIST_INSTANCE"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 53))
+while True:
+    d, a = s.recvfrom(4096)
+    threading.Thread(target=h, args=(s, d, a), daemon=True).start()
+DNSPROXY
 
-  local unique_ips=()
-  if [[ ${#whitelist_ips[@]} -gt 0 ]]; then
-    unique_ips=($(printf '%s\n' "${whitelist_ips[@]}" | sort -u))
-  fi
-  echo "  Resolved to ${#unique_ips[@]} unique IP(s)"
+  # Write the OpenRC init script locally
+  cat > "$INSTANCE_HOME/dns_proxy.init" <<INIEOF
+#!/sbin/openrc-run
+name=dns_proxy
+command=/usr/bin/python3
+command_args="/usr/local/bin/dns_proxy.py $HOST_PROXY_PORT"
+command_user=root
+INIEOF
 
-  local nft_rules="/tmp/.nft_${CGROUP_NAME}.rules"
-  cat > "$nft_rules" <<NFT
-flush table ip $NFT_TABLE;
-table ip $NFT_TABLE;
-
-chain nat_out {
-  type nat hook output priority 100;
-  meta cgroup v2 $cgroup_id udp dport 53 dnat to 127.0.0.1:$DNS_FILTER_PORT;
-  meta cgroup v2 $cgroup_id tcp dport 53 dnat to 127.0.0.1:$DNS_FILTER_PORT;
-}
-
-chain filter_out {
-  type filter hook output priority 0; policy accept;
-  meta cgroup v2 $cgroup_id ct state established accept;
-  meta cgroup v2 $cgroup_id ct state related accept;
-  meta cgroup v2 $cgroup_id ct state invalid drop;
-  meta cgroup v2 $cgroup_id ip daddr 127.0.0.1 accept;
-NFT
-
-  for ip in "${unique_ips[@]}"; do
-    echo "  meta cgroup v2 $cgroup_id ip daddr $ip accept;" >> "$nft_rules"
-  done
-
-  cat >> "$nft_rules" <<NFT
-  meta cgroup v2 $cgroup_id ip protocol tcp drop;
-  meta cgroup v2 $cgroup_id ip protocol udp drop;
+  # Write the nftables ruleset locally (avoids brace-quoting over SSH)
+  cat > "$INSTANCE_HOME/sandbox_proxy.nft" <<NFT
+table ip sandbox_proxy {
+  chain out {
+    type nat hook output priority -1
+    ip daddr 10.0.2.0/24 return
+    ip daddr 127.0.0.1 return
+    tcp dport 80 dnat to 10.0.2.100:$HOST_PROXY_PORT
+    tcp dport 443 dnat to 10.0.2.100:$HOST_PROXY_PORT
+  }
 }
 NFT
 
-  if ! nft -f "$nft_rules" 2>"$INSTANCE_HOME/nft_errors.log"; then
-    echo "  WARNING: nftables rules failed. See $INSTANCE_HOME/nft_errors.log" >&2
-    cat "$INSTANCE_HOME/nft_errors.log" >&2
-  else
-    echo "  Firewall active: only whitelist + localhost reachable from VM"
-  fi
+  # Copy all files into VM
+  local scp_opts="-i $SSH_KEY -P $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+  scp $scp_opts "$INSTANCE_HOME/dns_proxy.py" "root@127.0.0.1:/usr/local/bin/dns_proxy.py" 2>/dev/null
+  scp $scp_opts "$INSTANCE_HOME/dns_proxy.init" "root@127.0.0.1:/etc/init.d/dns_proxy" 2>/dev/null
+  scp $scp_opts "$INSTANCE_HOME/sandbox_proxy.nft" "root@127.0.0.1:/tmp/sandbox_proxy.nft" 2>/dev/null
 
-  rm -f "$nft_rules"
-}
+  # Apply: nftables from file + DNS service + resolv.conf
+  _ssh root "
+    set -e
+    && nft delete table ip sandbox_proxy 2>/dev/null || true
+    && nft -f /tmp/sandbox_proxy.nft
+    && ip route add default via 10.0.2.2
+    && rc-service dhcpcd stop 2>/dev/null || pkill dhcpcd 2>/dev/null || true
+    && sleep 0.3
+    && printf 'nameserver 127.0.0.1' > /etc/resolv.conf
+    && chmod 444 /etc/resolv.conf
+    && chmod +x /etc/init.d/dns_proxy
+    && rc-service dns_proxy start
+  "
 
-teardown_network_firewall() {
-  if have_cmd nft; then
-    nft flush table ip "$NFT_TABLE" 2>/dev/null || true
-    nft delete table ip "$NFT_TABLE" 2>/dev/null || true
-  fi
-  if [[ -d "$CGROUP_DIR" ]]; then
-    sleep 1
-    rmdir "$CGROUP_DIR" 2>/dev/null || true
-    rmdir "$(dirname "$CGROUP_DIR")" 2>/dev/null || true
-  fi
+  echo "  VM firewall active: nftables DNAT -> host proxy | DNS via 127.0.0.1"
 }
 
 #--------------------------------------------------------------------------------
@@ -908,10 +1002,6 @@ start_qemu() {
 
   echo "Starting QEMU/KVM..."
 
-  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$DNS_WHITELIST_INSTANCE" ]]; then
-    mkdir -p "$CGROUP_DIR"
-  fi
-
   qemu-system-x86_64 \
     -name "$VM_NAME" \
     --enable-kvm \
@@ -925,19 +1015,13 @@ start_qemu() {
     -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
     \
     -device "virtio-net-pci,netdev=host" \
-    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_WEB_PORT-:$OPENCODE_WEB_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT" \
+    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_WEB_PORT-:$OPENCODE_WEB_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:$HOST_PROXY_PORT-cmd:socat - TCP:127.0.0.1:$HOST_PROXY_PORT" \
     \
     -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
     -numa "node,memdev=mem" \
+    \
     -chardev "socket,id=fs0,path=$FS_SOCK" \
     -device "vhost-user-fs-pci,chardev=fs0,tag=workdir"
-
-  local qemu_pid
-  qemu_pid=$(cat "$QEMU_PIDFILE" 2>/dev/null || echo "")
-
-  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -n "$qemu_pid" ]] && [[ -f "$DNS_WHITELIST_INSTANCE" ]]; then
-    setup_network_firewall "$qemu_pid"
-  fi
 }
 
 wait_for_ssh() {
@@ -1082,7 +1166,6 @@ _run(){
   local context_size="${3:-124000}"
   local dns_whitelist_csv="${4:-}"
 
-  # Restart if already running
   if is_running qemu; then
     echo "============================================================"
     echo " Instance $INSTANCE_ID already running."
@@ -1100,21 +1183,27 @@ _run(){
   ensure_prereqs
   create_session_overlay
 
-  # Install per-instance DNS whitelist (optional)
   if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -n "$dns_whitelist_csv" ]]; then
-    install_dns_whitelist "$dns_whitelist_csv"
+    install_whitelist "$dns_whitelist_csv"
   fi
 
   start_virtiofsd
   start_haproxy
   start_registry
-  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$DNS_WHITELIST_INSTANCE" ]]; then
-    start_dns_filter
+
+  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$WHITELIST_FILE" ]]; then
+    start_host_proxy
   fi
+
   start_qemu
   wait_for_ssh
   mount_workdir
   configure_vm_env
+
+  if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$WHITELIST_FILE" ]]; then
+    setup_vm_firewall
+  fi
+
   run_agent "$agent" "$model" "$context_size"
 }
 
@@ -1314,8 +1403,14 @@ _status(){
 #--------------------------------------------------------------------------------
 
 stop_daemons() {
-  teardown_network_firewall
+  # Kill host proxy first (clean shutdown before VM dies)
+  if [[ -f "$HOST_PROXY_PIDFILE" ]]; then
+    echo "Stopping host_proxy..."
+    kill "$(cat "$HOST_PROXY_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$HOST_PROXY_PIDFILE"
+  fi
 
+  # Kill all remaining daemons via pidfiles
   find "$INSTANCE_HOME" -name '*.pid' | while read pidfile; do
     local pname
     pname="$(basename "$pidfile" .pid)"
@@ -1327,7 +1422,6 @@ stop_daemons() {
 
   rm -f "$AGENT_ALIVE"
   rm -f "$FS_SOCK"
-  rm -f "$INSTANCE_HOME/nft_errors.log"
 }
 
 _stop(){
