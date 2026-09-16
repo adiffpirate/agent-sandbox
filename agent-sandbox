@@ -104,7 +104,12 @@ HOST_PROXY_LOG="$INSTANCE_HOME/host_proxy.log"
 # Whitelist
 WHITELIST_FILE="$INSTANCE_HOME/dns-whitelist.txt"
 
+# LAN-facing OpenCode port. HAProxy owns this port on the host.
 OPENCODE_WEB_PORT=$((9090 + INSTANCE_PORT_OFFSET))
+
+# QEMU-only OpenCode port. This is intentionally bound to localhost on the host
+# and is never exposed directly to the LAN through QEMU hostfwd.
+OPENCODE_VM_PORT=$((19090 + INSTANCE_PORT_OFFSET))
 
 # VM internals
 VM_NAME="agent-sandbox-$INSTANCE_ID"
@@ -362,8 +367,6 @@ runcmd:
   # Install agent: opencode
   - npm install -g opencode-linux-x64-musl
   - ln -s /usr/local/lib/node_modules/opencode-linux-x64-musl/bin/opencode /usr/local/bin/opencode
-  # Dummy xdg-open for headless VM (opencode web tries to open browser)
-  - printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/xdg-open && chmod +x /usr/local/bin/xdg-open
   # Install agent: qwen
   - npm install -g @qwen-code/qwen-code@latest
   # Install agent: claude
@@ -539,7 +542,17 @@ start_haproxy(){
     exit 1
   fi
 
-  echo "Starting haproxy on port $HAPROXY_LISTEN_PORT..."
+  echo "Starting haproxy (LLM :$HAPROXY_LISTEN_PORT, OpenCode :$OPENCODE_WEB_PORT)..."
+
+  # Prefer the host address used to reach the configured LLM. This keeps
+  # OpenCode LAN access on the LAN interface instead of exposing it on every
+  # host interface. Fall back to 0.0.0.0 if route discovery is unavailable.
+  local opencode_bind_ip="${OPENCODE_BIND_IP:-}"
+  if [[ -z "$opencode_bind_ip" ]] && have_cmd ip; then
+    opencode_bind_ip="$(ip route get "$LOCAL_LLM_HOST" 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
+  fi
+  [[ -z "$opencode_bind_ip" ]] && opencode_bind_ip="0.0.0.0"
+
   cat > "$HAPROXY_CONFIG" <<EOF
 global
   log stdout format raw local0
@@ -561,6 +574,20 @@ frontend llm_in
 backend llm_out
   server llm $LOCAL_LLM_HOST:$LOCAL_LLM_SERVER_PORT
   option accept-invalid-http-response
+
+# OpenCode is exposed through HAProxy rather than directly through QEMU's
+# SLIRP hostfwd. QEMU listens only on 127.0.0.1:$OPENCODE_VM_PORT, while
+# HAProxy provides the normal host TCP listener for LAN clients.
+frontend opencode_in
+  mode tcp
+  bind $opencode_bind_ip:$OPENCODE_WEB_PORT
+  default_backend opencode_out
+
+backend opencode_out
+  mode tcp
+  server opencode 127.0.0.1:$OPENCODE_VM_PORT check
+  timeout connect 2s
+  timeout server 1h
 EOF
 
   nohup haproxy -f "$HAPROXY_CONFIG" -db -d > "$HAPROXY_LOG" 2>&1 &
@@ -1015,7 +1042,7 @@ start_qemu() {
     -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
     \
     -device "virtio-net-pci,netdev=host" \
-    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_WEB_PORT-:$OPENCODE_WEB_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:$HOST_PROXY_PORT-cmd:socat - TCP:127.0.0.1:$HOST_PROXY_PORT" \
+    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_VM_PORT-:$OPENCODE_VM_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:$HOST_PROXY_PORT-cmd:socat - TCP:127.0.0.1:$HOST_PROXY_PORT" \
     \
     -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
     -numa "node,memdev=mem" \
@@ -1078,6 +1105,24 @@ run_agent(){
   [[ -f "$AGENT_ALIVE" ]] && continue_session="--continue"
 
   if [[ $agent == "opencode" ]]; then
+    local opencode_bind_ip="${OPENCODE_BIND_IP:-}"
+    if [[ -z "$opencode_bind_ip" ]] && have_cmd ip; then
+      opencode_bind_ip="$(ip route get "$LOCAL_LLM_HOST" 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
+    fi
+    [[ -z "$opencode_bind_ip" ]] && opencode_bind_ip="0.0.0.0"
+
+    echo
+    echo "============================================================"
+    echo "OpenCode server starting:"
+    echo "  Local:  http://127.0.0.1:$OPENCODE_WEB_PORT"
+    if [[ "$opencode_bind_ip" != "0.0.0.0" ]]; then
+      echo "  LAN:    http://$opencode_bind_ip:$OPENCODE_WEB_PORT"
+    else
+      echo "  LAN:    http://<host-LAN-IP>:$OPENCODE_WEB_PORT"
+    fi
+    echo "============================================================"
+    echo
+
     _ssh $VM_AGENT_USER "
       mkdir -p ~/.config/opencode
       && printf '%s' '{
@@ -1106,7 +1151,7 @@ run_agent(){
           }
         }
       }' > ~/.config/opencode/opencode.json
-      && opencode web --port $OPENCODE_WEB_PORT --hostname 0.0.0.0
+      && opencode serve --port $OPENCODE_VM_PORT --hostname 0.0.0.0
     "
   elif [[ $agent == "claude" ]]; then
     _ssh $VM_AGENT_USER "
