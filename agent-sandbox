@@ -1126,6 +1126,7 @@ run_agent(){
     opencode_config_b64="$({
       printf '%s\n' '{'
       printf '%s\n' '  "$schema": "https://opencode.ai/config.json",'
+      printf '%s\n' '  "permission": "allow",'
       printf '%s\n' '  "model": "local/'"$model"'",'
       printf '%s\n' '  "provider": {'
       printf '%s\n' '    "local": {'
