@@ -1112,47 +1112,99 @@ run_agent(){
     [[ -z "$opencode_bind_ip" ]] && opencode_bind_ip="0.0.0.0"
 
     echo
+    echo "Starting OpenCode as an OpenRC service..."
+
+    # OpenCode itself is a foreground process. Let OpenRC own it so the SSH
+    # session can exit immediately while the VM and OpenCode stay alive.
+    #
+    # _ssh() intentionally removes newlines from remote commands, so do not
+    # use heredocs here. Encode the small service/wrapper files instead.
+    local opencode_config_b64
+    local opencode_wrapper_b64
+    local opencode_service_b64
+
+    opencode_config_b64="$({
+      printf '%s\n' '{'
+      printf '%s\n' '  "$schema": "https://opencode.ai/config.json",'
+      printf '%s\n' '  "model": "local/'"$model"'",'
+      printf '%s\n' '  "provider": {'
+      printf '%s\n' '    "local": {'
+      printf '%s\n' '      "npm": "@ai-sdk/openai-compatible",'
+      printf '%s\n' '      "name": "Local",'
+      printf '%s\n' '      "options": {'
+      printf '%s\n' '        "baseURL": "http://10.0.2.100:11434/v1"'
+      printf '%s\n' '      },'
+      printf '%s\n' '      "models": {'
+      printf '%s\n' '        "'"$model"'": {'
+      printf '%s\n' '          "name": "'"$model"'",'
+      printf '%s\n' '          "limit": {'
+      printf '%s\n' '            "context": '"$context_size"','
+      printf '%s\n' '            "output": '"$((context_size / 2))"
+      printf '%s\n' '          },'
+      printf '%s\n' '          "modalities": {'
+      printf '%s\n' '            "input": ["text", "audio", "image", "video", "pdf"],'
+      printf '%s\n' '            "output": ["text", "audio", "image", "video", "pdf"]'
+      printf '%s\n' '          }'
+      printf '%s\n' '        }'
+      printf '%s\n' '      }'
+      printf '%s\n' '    }'
+      printf '%s\n' '  }'
+      printf '%s\n' '}'
+    } | base64 -w0)"
+
+    opencode_wrapper_b64="$({
+      printf '%s\n' '#!/bin/sh'
+      printf '%s\n' 'export HOME=/home/'"$VM_AGENT_USER"
+      printf '%s\n' 'export USER='"$VM_AGENT_USER"
+      printf '%s\n' 'export LOGNAME='"$VM_AGENT_USER"
+      printf '%s\n' 'cd /home/'"$VM_AGENT_USER"'/workdir'
+      printf '%s\n' 'exec opencode serve --port '"$OPENCODE_VM_PORT"' --hostname 0.0.0.0'
+    } | base64 -w0)"
+
+    opencode_service_b64="$({
+      printf '%s\n' '#!/sbin/openrc-run'
+      printf '%s\n' 'name="opencode"'
+      printf '%s\n' 'description="OpenCode web server"'
+      printf '%s\n' 'command="/usr/local/bin/opencode-serve"'
+      printf '%s\n' 'command_user="'"$VM_AGENT_USER"'"'
+      printf '%s\n' 'command_background="yes"'
+      printf '%s\n' 'pidfile="/run/opencode.pid"'
+      printf '%s\n' 'output_log="/home/'"$VM_AGENT_USER"'/.local/state/opencode/opencode.log"'
+      printf '%s\n' 'error_log="/home/'"$VM_AGENT_USER"'/.local/state/opencode/opencode.err"'
+    } | base64 -w0)"
+
+    _ssh root "
+      mkdir -p /home/$VM_AGENT_USER/.config/opencode
+      && printf '%s' '$opencode_config_b64' | base64 -d > /home/$VM_AGENT_USER/.config/opencode/opencode.json
+      && printf '%s' '$opencode_wrapper_b64' | base64 -d > /usr/local/bin/opencode-serve
+      && chmod +x /usr/local/bin/opencode-serve
+      && printf '%s' '$opencode_service_b64' | base64 -d > /etc/init.d/opencode
+      && chmod +x /etc/init.d/opencode
+      && chown -R $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.config/opencode
+      && { rc-update add opencode default >/dev/null 2>&1 || :; }
+      && rc-service opencode restart
+      && sleep 2
+      && rc-service opencode status
+    "
+
+    # Mark the agent as started only after OpenCode has been handed off to OpenRC.
+    touch "$AGENT_ALIVE"
+
+    echo
     echo "============================================================"
-    echo "OpenCode server starting:"
+    echo "OpenCode server is running in the background."
     echo "  Local:  http://127.0.0.1:$OPENCODE_WEB_PORT"
     if [[ "$opencode_bind_ip" != "0.0.0.0" ]]; then
       echo "  LAN:    http://$opencode_bind_ip:$OPENCODE_WEB_PORT"
     else
       echo "  LAN:    http://<host-LAN-IP>:$OPENCODE_WEB_PORT"
     fi
+    echo
+    echo "  Service: agent-sandbox ssh root 'rc-service opencode status'"
     echo "============================================================"
     echo
 
-    _ssh $VM_AGENT_USER "
-      mkdir -p ~/.config/opencode
-      && printf '%s' '{
-        \"\$schema\": \"https://opencode.ai/config.json\",
-        \"model\": \"local/$model\",
-        \"provider\": {
-          \"local\": {
-            \"npm\": \"@ai-sdk/openai-compatible\",
-            \"name\": \"Local\",
-            \"options\": {
-              \"baseURL\": \"http://10.0.2.100:11434/v1\"
-            },
-            \"models\": {
-              \"$model\": {
-                \"name\": \"$model\",
-                \"limit\": {
-                  \"context\": $context_size,
-                  \"output\": $((context_size / 2))
-                },
-                \"modalities\": {
-                  \"input\": [\"text\", \"audio\", \"image\", \"video\", \"pdf\"],
-                  \"output\": [\"text\", \"audio\", \"image\", \"video\", \"pdf\"]
-                }
-              }
-            }
-          }
-        }
-      }' > ~/.config/opencode/opencode.json
-      && opencode serve --port $OPENCODE_VM_PORT --hostname 0.0.0.0
-    "
+
   elif [[ $agent == "claude" ]]; then
     _ssh $VM_AGENT_USER "
       export ANTHROPIC_BASE_URL='http://10.0.2.100:11434'
