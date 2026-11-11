@@ -142,8 +142,9 @@ password, because that lives in the settings file described below.
 
 ### Settings: `.env`
 
-The first `run` writes a `.env` file in the directory you run it from (mode `0600`) and every
-later `run` reads it, so that file — not a flag — is where the two secrets live:
+`run` writes a `.env` file for the instance in its own directory under
+`~/.local/share/agent-sandbox/instances/<id>/.env` (mode `0600`) and reads it on every run, so
+that file — not a flag — is where the two secrets live:
 
 ```bash
 # API key sent to the LLM at --local-llm-host. Leave empty for an LLM that needs no key.
@@ -153,27 +154,33 @@ LLM_API_KEY=
 OPENCODE_PASSWORD=<generated on the first run>
 ```
 
-- **`LLM_API_KEY`** is written into the in-VM OpenCode config as
+The instance id comes from the directory you run in, so each project has its own settings file,
+and `agent-sandbox status` shows which id belongs to which directory:
+
+```bash
+INST=$(agent-sandbox status | awk '$2=="on"{print $1; exit}')
+ENV_FILE=~/.local/share/agent-sandbox/instances/$INST/.env
+```
+
+- **`LLM_API_KEY`** is injected into the in-VM OpenCode config as
   `providers.local.settings.apiKey`, which is the key the agent sends to `--local-llm-host`.
   An empty value keeps the placeholder `local` that keyless servers use. Only
   letters, digits and `. _ : + / = -` are accepted, because the value ends up in JSON.
 - **`OPENCODE_PASSWORD`** signs the browser UI, the HTTP API and the OpenCode CLI. A blank
   value means "generate a new one", never "run without a password".
 
-**Edit the file, then rerun `agent-sandbox run`** — a rerun with a new password restarts
-`opencode.service` with it, so the new password works and the old one stops working. `run`
-prints `Settings: <path>` and stops if the file cannot be read or written. Two things to know:
-the file sits in the shared workdir, so inside the VM it is readable as
-`/home/agent/workdir/.env` (share only directories you trust), and if the workdir is a git
-working tree `run` warns until `.env` is in `.gitignore`. With `--workdir-ro` the file has to
-exist before the run. Older releases kept the generated password in
-`~/.local/share/agent-sandbox/instances/<id>/opencode.env`; the first run moves it into `.env`
-and deletes that file.
+**Edit the file, then rerun `agent-sandbox run` in the same directory** — a rerun with a new
+password restarts `opencode.service` with it, so the new password works and the old one stops
+working. `run` prints the file's path and stops if the value is unusable (it never prints the
+values). The file stays on the host: it is not part of the shared workdir, so nothing inside the
+VM can read it. `clean` keeps it; `purge` deletes it along with the instance. Older releases kept
+the generated password in `instances/<id>/opencode.env`; the first run moves it into `.env` and
+deletes that file.
 
 ### Connect to OpenCode
 
 HAProxy publishes the agent's port on `0.0.0.0` and OpenCode guards it with Basic auth
-(username `opencode`, the password from `.env`), so all of the routes below work from the host
+(username `opencode`, the password from that `.env`), so all of the routes below work from the host
 and from any other machine on the network. Replace `9805` with the port `run` prints.
 
 **In a browser** — open `http://<host address>:9805`; the same address works on the host itself
@@ -184,7 +191,8 @@ and "Password" to `OPENCODE_PASSWORD` — there is no user name in that form.
 **Over the HTTP API** — OpenCode answers its usual V2 API inside the guest:
 
 ```bash
-PW=$(sed -n 's/^OPENCODE_PASSWORD=//p' .env)   # the file 'run' reads
+INST=$(agent-sandbox status | awk '$2=="on"{print $1; exit}')
+PW=$(sed -n 's/^OPENCODE_PASSWORD=//p' ~/.local/share/agent-sandbox/instances/$INST/.env)
 API=http://<host address>:9805                 # the address 'run' prints
 AUTH="opencode:$PW"
 JSON='content-type: application/json'
@@ -281,7 +289,12 @@ What the golden image and a running instance enforce:
 - **Base image**: Ubuntu Minimal — no snapd (purged at build), no docs/man pages, no build toolchain, volatile journald capped at 64 MB. The agent account is pinned to uid 1001 / gid 1002 (`VM_AGENT_UID`/`VM_AGENT_GID`) and the build aborts if that did not happen.
 - **Accounts**: a default user inherited from the base image is locked with `nologin`; SSH accepts only `agent` and `root`, publickey only, `MaxAuthTries 3`, no password/keyboard-interactive auth, no TCP forwarding or tunnels. Root has a random password that exists for the serial console only.
 - **OpenCode**: runs as an unprivileged `systemd` service with `ProtectSystem=full`, `ProtectKernelTunables`, `ProtectKernelLogs`, `PrivateTmp`; inside the VM its password lives in a root-owned `0600` env file that the agent user cannot read. Free upstream models are disabled (`OPENCODE_DISABLE_FREE_MODELS=1`).
-- **Secrets**: `LLM_API_KEY` and `OPENCODE_PASSWORD` live in a `0600` `.env` file in the shared workdir and are never printed by `run`. Inside the VM they are as visible as anything you share: the agent reads `/home/agent/workdir/.env`, and `LLM_API_KEY` is also written into the agent's own `opencode.json`. Share only directories you trust, and keep `.env` out of git (`run` warns if it is not ignored).
+- **Secrets**: `LLM_API_KEY` and `OPENCODE_PASSWORD` live in a `0600` `.env` inside the instance
+  directory on the host (`~/.local/share/agent-sandbox/instances/<id>/.env`), never in the shared
+  workdir, so nothing inside the VM can read that file. `run` never prints either value.
+  `LLM_API_KEY` is injected into the agent's own `opencode.json`
+  (`providers.local.settings.apiKey`), because that is where OpenCode reads provider credentials:
+  an agent that can read its own config can see the key it already uses against the LLM host.
 - **Outer network layer**: QEMU's user-mode NIC runs with `restrict=on`, so the guest cannot open any outbound connection that is not one of the explicit `hostfwd`/`guestfwd` channels (SSH, the OpenCode port, the LLM proxy, the registry, the whitelist proxy).
 - **Guest firewall** (when `--dns-whitelist` is set): applied by `/usr/local/bin/agent-sandbox-firewall.sh apply`, which **fails closed** — if the nftables ruleset does not load, `agent-sandbox run` stops instead of starting an agent with no policy. The ruleset sets `input` policy `drop` (accepting only loopback, established flows, DHCP renewals, Docker-bridge DNS and the two host-forwarded ports) and DNATs every outbound 80/443 to the host's domain-whitelist proxy. `systemd-resolved` is masked and `/etc/resolv.conf` is made immutable so nothing can reopen DNS; AAAA queries are answered with NODATA because only IPv4 is proxied. `dns-proxy` and the ruleset are systemd units, so the policy survives a VM reboot.
 - **Identity mapping**: virtiofsd maps the guest's pinned agent ids onto the host user (`--uid-map=:1001:<host uid>:1:`), which is what makes writes in `/home/agent/workdir` land on the host owned by you. If you change `VM_AGENT_UID`/`VM_AGENT_GID`, rebuild the golden image.
