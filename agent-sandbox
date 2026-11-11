@@ -21,7 +21,7 @@ Run options:
   --context-size <size>      Maximum context window for opencode (half for output limit). Default: 124000
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
-  --local-llm-host <ip>      LLM address on the host. Default: 127.0.0.1 (or $LOCAL_LLM_HOST)
+  --local-llm-host <ip>      LLM address on the host. Default: 192.168.0.210 (or $LOCAL_LLM_HOST)
   --local-llm-port <port>    Host port for LLM proxy. Default: 8080
   --restrict-network on|off  Restrict VM network. Default: on
   --dns-whitelist <domains>  Comma-separated list of allowed domains.
@@ -38,7 +38,7 @@ Run options:
 Build options:
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
-  --local-llm-host <ip>      LLM address on the host. Default: 127.0.0.1 (or $LOCAL_LLM_HOST)
+  --local-llm-host <ip>      LLM address on the host. Default: 192.168.0.210 (or $LOCAL_LLM_HOST)
   --local-llm-port <port>    Host port for LLM proxy. Default: 8080
 
 Environment overrides:
@@ -99,7 +99,7 @@ INSTANCE_PORT_OFFSET=$(( 16#$(echo -n "$INSTANCE_ID" | md5sum | head -c 4) % 100
 SSH_PORT=$((2222 + INSTANCE_PORT_OFFSET))
 
 HAPROXY_LISTEN_PORT=$((11434 + INSTANCE_PORT_OFFSET))
-LOCAL_LLM_HOST="${LOCAL_LLM_HOST:-127.0.0.1}"
+LOCAL_LLM_HOST="${LOCAL_LLM_HOST:-192.168.0.210}"
 LOCAL_LLM_SERVER_PORT="8080"
 
 REGISTRY_LISTEN_PORT=$((5000 + INSTANCE_PORT_OFFSET))
@@ -917,19 +917,6 @@ start_virtiofsd() {
   done
 }
 
-# Address HAProxy publishes the guest's OpenCode port on. It follows the interface
-# the host uses to reach the configured LLM, so pointing --local-llm-host at a LAN
-# address publishes OpenCode on the LAN as well. Otherwise the port stays on
-# loopback: OPENCODE_BIND_IP=0.0.0.0 (or a chosen address) is the explicit opt-in.
-opencode_bind_address() {
-  local bind_ip="${OPENCODE_BIND_IP:-}"
-  if [[ -z "$bind_ip" ]] && have_cmd ip; then
-    bind_ip="$(ip route get "$LOCAL_LLM_HOST" 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)"
-  fi
-  [[ -z "$bind_ip" ]] && bind_ip="127.0.0.1"
-  echo "$bind_ip"
-}
-
 start_haproxy(){
   if is_running haproxy; then
     echo "haproxy already running, skipping"
@@ -942,9 +929,6 @@ start_haproxy(){
   fi
 
   echo "Starting haproxy (LLM :$HAPROXY_LISTEN_PORT, OpenCode :$OPENCODE_WEB_PORT)..."
-
-  local opencode_bind_ip
-  opencode_bind_ip="$(opencode_bind_address)"
 
   cat > "$HAPROXY_CONFIG" <<EOF
 global
@@ -970,10 +954,10 @@ backend llm_out
 
 # OpenCode is exposed through HAProxy rather than directly through QEMU's
 # SLIRP hostfwd. QEMU listens only on 127.0.0.1:$OPENCODE_VM_PORT, while
-# HAProxy provides the normal host TCP listener for LAN clients.
+# HAProxy publishes the port on every host interface (Basic auth protects it).
 frontend opencode_in
   mode tcp
-  bind $opencode_bind_ip:$OPENCODE_WEB_PORT
+  bind 0.0.0.0:$OPENCODE_WEB_PORT
   default_backend opencode_out
 
 backend opencode_out
@@ -1838,9 +1822,6 @@ start_opencode(){
   local model=$1
   local context_size=$2
 
-  local opencode_bind_ip
-  opencode_bind_ip="$(opencode_bind_address)"
-
   # OpenCode V2 serves its web UI from the same origin and protects it with
   # Basic auth (username is always "opencode"). Reuse the previous password so
   # restarting an instance does not invalidate paired browser sessions.
@@ -1906,12 +1887,7 @@ start_opencode(){
   echo "============================================================"
   echo "OpenCode V2 is running inside the VM as a systemd service."
   echo "  Local:   http://127.0.0.1:$OPENCODE_WEB_PORT"
-  case "$opencode_bind_ip" in
-    0.0.0.0) echo "  LAN:     http://<host-LAN-IP>:$OPENCODE_WEB_PORT   (published on all interfaces)" ;;
-    127.*)   echo "  LAN:     not published, HAProxy binds loopback. Use --local-llm-host <LAN IP>"
-             echo "           or OPENCODE_BIND_IP=0.0.0.0 to expose it on the LAN." ;;
-    *)       echo "  LAN:     http://$opencode_bind_ip:$OPENCODE_WEB_PORT" ;;
-  esac
+  echo "  LAN:     http://<host-ip>:$OPENCODE_WEB_PORT (published on all interfaces)"
   echo
   echo "  Sign in: user opencode / password $server_password"
   echo "  Saved:   $OPENCODE_ENV"
@@ -2039,14 +2015,32 @@ _ssh(){
 
 sync_docker() {
   local filter_regex="$1"
+  if ! have_cmd docker; then
+    echo "ERROR: 'sync docker' needs a local docker CLI (and a running daemon) on this host." >&2
+    exit 1
+  fi
+  if ! docker images --format '{{.Repository}}:{{.Tag}}' > /dev/null 2>&1; then
+    echo "ERROR: the local docker daemon is not reachable." >&2
+    exit 1
+  fi
   echo "Syncing Docker images to registry at 127.0.0.1:$REGISTRY_LISTEN_PORT..."
-  docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '127.0.0.1' | grep -E "$filter_regex" | while read -r img; do
+  local images="" rc=0
+  images="$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '127.0.0.1' | grep -E "$filter_regex")" || rc=$?
+  if [[ "$rc" -ge 2 ]]; then
+    echo "ERROR: invalid filter expression '$filter_regex'." >&2
+    exit 1
+  fi
+  if [[ -z "$images" ]]; then
+    echo "Nothing to sync (no local image matches '$filter_regex')."
+    return
+  fi
+  while IFS= read -r img; do
     echo
     echo "Syncing $img"
     local target="127.0.0.1:$REGISTRY_LISTEN_PORT/$img"
     docker tag "$img" "$target"
     docker push "$target"
-  done
+  done <<< "$images"
 }
 
 sync_files() {
@@ -2085,11 +2079,28 @@ sync_files() {
   echo "Syncing $host_path -> $vm_path (rsync incremental)"
   local vm_dir
   vm_dir=$(dirname "$vm_path")
-  _ssh root "mkdir -p '$vm_dir'"
+  # Make sure the target directory exists *and* is writable by the user rsync
+  # connects as: a root-owned directory used to reject the agent user's write
+  # ("rsync: [receiver] mkstemp ... Permission denied").
+  if [[ "$ssh_user" == root ]]; then
+    if ! _ssh root "mkdir -p '$vm_dir'"; then
+      echo "ERROR: could not create $vm_dir in the VM" >&2
+      exit 1
+    fi
+  else
+    if ! _ssh root "mkdir -p '$vm_dir' && chown '$ssh_user' '$vm_dir'"; then
+      echo "ERROR: could not create $vm_dir in the VM for user $ssh_user" >&2
+      exit 1
+    fi
+  fi
 
-  rsync -az --partial \
-    -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+  if ! rsync -az --partial \
+    -e "ssh -i $SSH_KEY -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
     "$host_path" "${ssh_user}@127.0.0.1:${vm_path%/}"
+  then
+    echo "ERROR: rsync into the VM failed" >&2
+    exit 1
+  fi
 }
 
 _sync(){

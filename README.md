@@ -175,9 +175,13 @@ agent-sandbox sync file <host_path>[:<vm_path>]
 ```
 
 **`docker`** — Pushes local Docker images matching the filter regex to the sandbox's internal registry
-so the VM can pull them without internet access.
+so the VM can pull them without internet access. This needs a local `docker` CLI and daemon;
+images that already live in the registry (`127.0.0.1:<port>/...`) are skipped. Inside the VM the
+`docker` command is a wrapper that rewrites unqualified image names to `10.0.2.100:5000`, so
+`docker pull alpine:3.20` resolves against the registry you just synced into.
 
 **`file`** — Copies files or directories from the host into the VM with `rsync` (incremental).
+It adds and updates files; it never deletes inside the VM (`rsync` runs without `--delete`).
 If only `<host_path>` is provided, `<vm_path>` defaults to the same path
 (with `/home/<user>/...` translated to `/home/agent/...`).
 Paths under `/home` and `/tmp` use the `agent` user; all other paths use `root`.
@@ -207,7 +211,7 @@ agent-sandbox purge     # Delete everything including the golden image
 | `--context-size` | `124000` | Context window advertised to OpenCode (output limit is half) |
 | `--vm-memory` | `4G` | VM RAM (e.g. 4G, 8G) |
 | `--vm-threads` | 80% of host | VM CPU threads |
-| `--local-llm-host` | `127.0.0.1` | Where the host-side HAProxy forwards the VM's LLM traffic (an LLM listening on this machine works out of the box; `LOCAL_LLM_HOST` overrides) |
+| `--local-llm-host` | `192.168.0.210` | Where the host-side HAProxy forwards the VM's LLM traffic (any host on your network that speaks OpenAI-compatible HTTP; `LOCAL_LLM_HOST` overrides) |
 | `--local-llm-port` | `8080` | Host port for LLM proxy |
 | `--restrict-network` | `on` | Restrict VM network to only LLM and registry |
 | `--dns-whitelist` | – | Comma-separated domains allowed through, e.g. `github.com,npmjs.org`. Remembered per working directory: later runs of the same directory keep it until `purge` or a new `--dns-whitelist` |
@@ -219,7 +223,7 @@ agent-sandbox purge     # Delete everything including the golden image
 |---|---|---|
 | `--vm-memory` | `4G` | VM RAM while cloud-init provisions the golden image |
 | `--vm-threads` | 80% of host | VM CPU threads while building |
-| `--local-llm-host` | `127.0.0.1` | Recorded as the LLM proxy host |
+| `--local-llm-host` | `192.168.0.210` | Host IP for the LLM proxy |
 | `--local-llm-port` | `8080` | Recorded as the LLM proxy port |
 
 ### Hardening
@@ -232,7 +236,7 @@ What the golden image and a running instance enforce:
 - **Outer network layer**: QEMU's user-mode NIC runs with `restrict=on`, so the guest cannot open any outbound connection that is not one of the explicit `hostfwd`/`guestfwd` channels (SSH, the OpenCode port, the LLM proxy, the registry, the whitelist proxy).
 - **Guest firewall** (when `--dns-whitelist` is set): applied by `/usr/local/bin/agent-sandbox-firewall.sh apply`, which **fails closed** — if the nftables ruleset does not load, `agent-sandbox run` stops instead of starting an agent with no policy. The ruleset sets `input` policy `drop` (accepting only loopback, established flows, DHCP renewals, Docker-bridge DNS and the two host-forwarded ports) and DNATs every outbound 80/443 to the host's domain-whitelist proxy. `systemd-resolved` is masked and `/etc/resolv.conf` is made immutable so nothing can reopen DNS; AAAA queries are answered with NODATA because only IPv4 is proxied. `dns-proxy` and the ruleset are systemd units, so the policy survives a VM reboot.
 - **Identity mapping**: virtiofsd maps the guest's pinned agent ids onto the host user (`--uid-map=:1001:<host uid>:1:`), which is what makes writes in `/home/agent/workdir` land on the host owned by you. If you change `VM_AGENT_UID`/`VM_AGENT_GID`, rebuild the golden image.
-- **Host side**: the OpenCode port is bound to `127.0.0.1` inside QEMU and only published through HAProxy on the LAN interface, protected by the Basic-auth password.
+- **Host side**: QEMU binds the OpenCode port to `127.0.0.1` only; HAProxy is the single host listener and publishes it on `0.0.0.0`, protected by the Basic-auth password.
 
 Notes:
 
