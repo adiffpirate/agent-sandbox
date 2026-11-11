@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE_EOF'
 Usage:
-  agent-sandbox run [--agent <agent>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro] (requires prior 'build')
+  agent-sandbox run [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro] (requires prior 'build')
   agent-sandbox ssh <user> <command>
   agent-sandbox build <extra_command>
   agent-sandbox sync docker [filter_regex]
@@ -14,13 +14,14 @@ Usage:
   agent-sandbox clean
   agent-sandbox purge
 
+The only agent this tool runs is OpenCode V2, as a systemd service inside the VM.
+
 Run options:
-  --agent <agent>            Agent to run (opencode, claude, qwen, ssh). Default: opencode (web mode)
   --model <model>            Model to use. Default: code
   --context-size <size>      Maximum context window for opencode (half for output limit). Default: 124000
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
-  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.210
+  --local-llm-host <ip>      LLM address on the host. Default: 127.0.0.1 (or $LOCAL_LLM_HOST)
   --local-llm-port <port>    Host port for LLM proxy. Default: 8080
   --restrict-network on|off  Restrict VM network. Default: on
   --dns-whitelist <domains>  Comma-separated list of allowed domains.
@@ -37,8 +38,14 @@ Run options:
 Build options:
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
   --vm-threads <count>       VM CPU threads. Default: 80% of host threads
-  --local-llm-host <ip>      Host IP for LLM proxy. Default: 192.168.0.210
+  --local-llm-host <ip>      LLM address on the host. Default: 127.0.0.1 (or $LOCAL_LLM_HOST)
   --local-llm-port <port>    Host port for LLM proxy. Default: 8080
+
+Environment overrides:
+  OPENCODE_VERSION           Pin the OpenCode V2 version (default: latest)
+  OPENCODE_TARGET            Platform package (default: cli-linux-x64).
+                             Use cli-linux-x64-baseline on CPUs without AVX2.
+  EXTRA_PACKAGES             Space-separated apt packages to add to the golden image
 USAGE_EOF
   exit 1
 }
@@ -56,9 +63,27 @@ META_DATA="$SANDBOX_HOME/meta-data"
 SSH_KEY="$SANDBOX_HOME/agent-sandbox_ed25519"
 SSH_PUB="$SSH_KEY.pub"
 OVMF_CODE_COPY="$SANDBOX_HOME/OVMF_CODE.fd"
-DOWNLOAD_IMAGE="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
-OVMF_CODE_SOURCE="/usr/share/ovmf/OVMF.fd"
-OVMF_VARS_SOURCE="/usr/share/ovmf/OVMF.fd"
+# Ubuntu Minimal 24.04 LTS cloud image (glibc + systemd, cloud-init ready, ~248 MB).
+# "Minimal" is Ubuntu's small-footprint cloud flavour: cloud-init, openssh-server,
+# python3, netplan, linux-image-virtual, and nothing a human would log in with.
+# Swap "noble" for "resolute" here if you want the 26.04 LTS base instead.
+DOWNLOAD_IMAGE="https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
+# Optional firmware overrides: OVMF_CODE_SOURCE=/path/to/CODE.fd
+# OVMF_VARS_SOURCE=/path/to/VARS.fd. Left empty, the script picks the
+# Debian/Ubuntu split pair itself. Do not point both at one combined image:
+# without a separate writable variable store EDK2 falls back to putting its
+# 'NvVars' file on the first filesystem it can write to, which is the shared
+# workdir (see uefi_pflash_args).
+OVMF_CODE_SOURCE="${OVMF_CODE_SOURCE:-}"
+OVMF_VARS_SOURCE="${OVMF_VARS_SOURCE:-}"
+
+# OpenCode V2 release channel (npm-hosted platform packages).
+OPENCODE_VERSION="${OPENCODE_VERSION:-}"
+OPENCODE_TARGET="${OPENCODE_TARGET:-cli-linux-x64}"
+OPENCODE_METADATA_URL="https://opencode.ai/update/api/latest/cli/npm"
+
+# Extra apt packages for the golden image, e.g. EXTRA_PACKAGES="build-essential python3-pip"
+EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
 
 WORKDIR="$(pwd)"
 
@@ -74,18 +99,20 @@ INSTANCE_PORT_OFFSET=$(( 16#$(echo -n "$INSTANCE_ID" | md5sum | head -c 4) % 100
 SSH_PORT=$((2222 + INSTANCE_PORT_OFFSET))
 
 HAPROXY_LISTEN_PORT=$((11434 + INSTANCE_PORT_OFFSET))
-LOCAL_LLM_HOST="192.168.0.210"
+LOCAL_LLM_HOST="${LOCAL_LLM_HOST:-127.0.0.1}"
 LOCAL_LLM_SERVER_PORT="8080"
 
 REGISTRY_LISTEN_PORT=$((5000 + INSTANCE_PORT_OFFSET))
 REGISTRY_ENDPOINT="10.0.2.100:5000"
+# The registry binary normally lives in /usr/local/bin; allow a user-local copy.
+REGISTRY_BIN="${REGISTRY_BIN:-$(command -v registry 2>/dev/null || echo "$HOME/.local/bin/registry")}"
 
 SESSION_IMAGE="$INSTANCE_HOME/vm-session-disk.qcow2"
 OVMF_VARS_COPY="$INSTANCE_HOME/OVMF_VARS.fd"
 FS_SOCK="$INSTANCE_HOME/virtiofsd.sock"
 QEMU_PIDFILE="$INSTANCE_HOME/qemu.pid"
 QEMU_LOG="$INSTANCE_HOME/qemu.log"
-VIRTIOFSD_PIDFILE="$INSTANCE_HOME/virtiofsd.sock.pid"
+VIRTIOFSD_PIDFILE="$INSTANCE_HOME/virtiofsd.pid"
 VIRTIOFSD_LOG="$INSTANCE_HOME/virtiofsd.log"
 HAPROXY_CONFIG="$INSTANCE_HOME/haproxy.conf"
 HAPROXY_PIDFILE="$INSTANCE_HOME/haproxy.pid"
@@ -94,7 +121,14 @@ REGISTRY_CONFIG="$INSTANCE_HOME/registry.conf"
 REGISTRY_PIDFILE="$INSTANCE_HOME/registry.pid"
 REGISTRY_LOG="$INSTANCE_HOME/registry.log"
 REGISTRY_DIR="$INSTANCE_HOME/registry"
-AGENT_ALIVE="$INSTANCE_HOME/agent.alive"
+# Host-side copy of the OpenCode server credentials (0600), regenerated on every run.
+OPENCODE_ENV="$INSTANCE_HOME/opencode.env"
+# Records which base image + OpenCode version the golden image was built against.
+IMAGE_STAMP="$SANDBOX_HOME/vm-image.stamp"
+# Printed to the guest console by the last runcmd step; 'build' requires it.
+PROVISION_SENTINEL="agent-sandbox-provision-ok"
+# Guard against a guest that never powers itself off.
+BUILD_TIMEOUT="${BUILD_TIMEOUT:-2400}"
 
 # Host-side proxy (handles HTTP/HTTPS + DNS, per-instance)
 HOST_PROXY_PORT=$((14000 + INSTANCE_PORT_OFFSET))
@@ -114,6 +148,13 @@ OPENCODE_VM_PORT=$((19090 + INSTANCE_PORT_OFFSET))
 # VM internals
 VM_NAME="agent-sandbox-$INSTANCE_ID"
 VM_DISK_SIZE="20G"
+# QEMU acceleration: kvm by default, "tcg" for hosts without /dev/kvm access.
+SANDBOX_ACCEL="${SANDBOX_ACCEL:-kvm}"
+# "-cpu host" is invalid under TCG, where "max" is the closest equivalent.
+if [[ -z "${VM_CPU_MODEL:-}" ]]; then
+  if [[ "$SANDBOX_ACCEL" == "kvm" ]]; then VM_CPU_MODEL="host"; else VM_CPU_MODEL="max"; fi
+fi
+
 VM_MEMORY_RAM="4G"
 VM_THREADS=$(( $(nproc 2>/dev/null || echo 4) * 80 / 100 ))
 [[ "$VM_THREADS" -lt 1 ]] && VM_THREADS=4
@@ -121,9 +162,15 @@ VM_RESTRICT_NETWORK="on"
 VM_WORKDIR_RO="off"
 VM_AGENT_USER="agent"
 VM_AGENT_WORKDIR="/home/$VM_AGENT_USER/workdir"
+# The guest ids virtiofsd maps onto the host user running this script. The golden
+# image pins the agent account to exactly these ids, so shared files land on the
+# host owned by whoever started the sandbox. Change both together if 1001/1002
+# collide with something in a custom image.
+VM_AGENT_UID="${VM_AGENT_UID:-1001}"
+VM_AGENT_GID="${VM_AGENT_GID:-1002}"
 
-CMD_DEFAULT_RUN_AGENT="opencode"
-CMD_DEFAULT_RUN_LOCAL_MODEL="code"
+CMD_DEFAULT_MODEL="code"
+CMD_DEFAULT_CONTEXT_SIZE=124000
 
 #--------------------------------------------------------------------------------
 # MAIN
@@ -139,24 +186,32 @@ main() {
 
   case "$subcommand" in
     build)
-      local cmd="${*:-echo}"
+      local cmd=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --vm-memory)     VM_MEMORY_RAM="$2"; shift 2 ;;
+          --vm-threads)    VM_THREADS="$2"; shift 2 ;;
+          --local-llm-host) LOCAL_LLM_HOST="$2"; shift 2 ;;
+          --local-llm-port) LOCAL_LLM_SERVER_PORT="$2"; shift 2 ;;
+          --)              shift; cmd="$*"; break ;;
+          *)               cmd="$*"; break ;;
+        esac
+      done
       _build "$cmd"
       ;;
     run)
-      local agent="$CMD_DEFAULT_RUN_AGENT"
-      local model="$CMD_DEFAULT_RUN_LOCAL_MODEL"
+      local model="$CMD_DEFAULT_MODEL"
       local vm_memory="$VM_MEMORY_RAM"
       local vm_threads="$VM_THREADS"
       local local_llm_host="$LOCAL_LLM_HOST"
       local local_llm_server_port="$LOCAL_LLM_SERVER_PORT"
-      local context_size=124000
+      local context_size="$CMD_DEFAULT_CONTEXT_SIZE"
       local restrict_network="$VM_RESTRICT_NETWORK"
       local workdir_ro="$VM_WORKDIR_RO"
       local dns_whitelist=""
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --agent) agent="$2"; shift 2 ;;
           --model) model="$2"; shift 2 ;;
           --context-size) context_size="$2"; shift 2 ;;
           --vm-memory) vm_memory="$2"; shift 2 ;;
@@ -176,7 +231,7 @@ main() {
       LOCAL_LLM_SERVER_PORT="$local_llm_server_port"
       VM_RESTRICT_NETWORK="$restrict_network"
       VM_WORKDIR_RO="$workdir_ro"
-      _run "$agent" "$model" "$context_size" "$dns_whitelist"
+      _run "$model" "$context_size" "$dns_whitelist"
       ;;
     ssh)
       local user="${1:-$VM_AGENT_USER}"
@@ -230,7 +285,98 @@ virtiofsd_bin() {
 
 is_running(){
   local daemon=$1
-  _status | grep "$INSTANCE_ID" | grep -q "$daemon"
+  local pidfile
+  pidfile="$(pidfile_for "$daemon")"
+  [[ -f "$pidfile" ]] || return 1
+
+  local pid
+  pid="$(cat "$pidfile" 2>/dev/null)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  # A pidfile whose process is gone would otherwise make 'run' skip starting
+  # the daemon it refers to.
+  rm -f "$pidfile"
+  return 1
+}
+
+pidfile_for(){
+  case "$1" in
+    virtiofsd)   echo "$VIRTIOFSD_PIDFILE" ;;
+    haproxy)     echo "$HAPROXY_PIDFILE" ;;
+    registry)    echo "$REGISTRY_PIDFILE" ;;
+    qemu)        echo "$QEMU_PIDFILE" ;;
+    host_proxy)  echo "$HOST_PROXY_PIDFILE" ;;
+    *)           echo "$INSTANCE_HOME/$1.pid" ;;
+  esac
+}
+
+# Pidfiles are named after the daemon that wrote them. One left behind by an
+# older version of this script (virtiofsd's was renamed) would otherwise show up
+# as a second phantom daemon in 'status' and be killed twice by 'stop', so the
+# same process recorded under two names collapses to one entry.
+instance_pidfiles() {
+  local instance_dir="$1"
+  local pidfile pid seen=""
+  for pidfile in "$instance_dir"/*.pid; do
+    [[ -f "$pidfile" ]] || continue
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    if [[ -n "$pid" && " $seen " == *" $pid "* ]]; then
+      rm -f "$pidfile"
+      continue
+    fi
+    seen="$seen $pid"
+    echo "$pidfile"
+  done
+}
+
+# Seed ISO builder: genisoimage/mkisofs are deprecated aliases on modern Ubuntu,
+# where xorriso provides the same behaviour with "-as mkisofs".
+iso_tool() {
+  if have_cmd genisoimage; then
+    echo "genisoimage"
+  elif have_cmd mkisofs; then
+    echo "mkisofs"
+  elif have_cmd xorriso; then
+    echo "xorriso -as mkisofs"
+  else
+    return 1
+  fi
+}
+
+build_seed_iso() {
+  local tool
+  if ! tool="$(iso_tool)"; then
+    echo "ERROR: no ISO tool available. Install one of: genisoimage, mkisofs, xorriso." >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2086  # "xorriso -as mkisofs" must stay word-split
+  $tool -output "$SEED_ISO" -volid cidata -rock "$USER_DATA" "$META_DATA" >/dev/null
+}
+
+random_password() {
+  # 48 lowercase hex chars: YAML/shell safe, fixed length, and no SIGPIPE under
+  # pipefail (od exits on its own; tr reads to EOF).
+  od -An -tx1 -N 24 /dev/urandom | tr -d ' \n'
+}
+
+# Resolve the OpenCode V2 version once per build, then pin it into the golden image.
+resolve_opencode_version() {
+  if [[ -n "$OPENCODE_VERSION" ]]; then
+    echo "$OPENCODE_VERSION"
+    return
+  fi
+  local meta
+  meta="$(curl -fsSL --max-time 30 "$OPENCODE_METADATA_URL" 2>/dev/null || true)"
+  local version
+  version="$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' <<< "$meta")"
+  if [[ -z "$version" ]]; then
+    echo "ERROR: Could not resolve the latest OpenCode version from $OPENCODE_METADATA_URL" >&2
+    echo "       Pin it with OPENCODE_VERSION=<version> and retry." >&2
+    exit 1
+  fi
+  echo "$version"
 }
 
 #--------------------------------------------------------------------------------
@@ -248,29 +394,41 @@ ensure_prereqs() {
 ensure_packages() {
   local missing=0
 
-  for c in "curl" "pwgen" "ssh" "ssh-keygen" "genisoimage" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "registry" "socat" "rsync" "python3"; do
+  for c in "curl" "ssh" "ssh-keygen" "qemu-system-x86_64" "qemu-img" "newuidmap" "nc" "haproxy" "socat" "rsync" "python3"; do
     if ! have_cmd "$c"; then
       echo "Missing command: $c" >&2
       missing=1
     fi
   done
 
+  if [[ ! -x "$REGISTRY_BIN" ]]; then
+    echo "Missing binary: OCI registry ($REGISTRY_BIN)" >&2
+    missing=1
+  fi
+
+  if ! iso_tool >/dev/null 2>&1; then
+    echo "Missing command: genisoimage, mkisofs or xorriso (needed to build the cloud-init seed)" >&2
+    missing=1
+  fi
+
   if ! virtiofsd_bin >/dev/null 2>&1; then
     echo "Missing command: virtiofsd" >&2
     missing=1
   fi
 
-  if [[ ! -f "$OVMF_CODE_SOURCE" ]]; then
-    echo "Missing UEFI firmware: ovmf" >&2
+  if ! uefi_find_code >/dev/null 2>&1; then
+    echo "Missing UEFI firmware: install 'ovmf' (or set OVMF_CODE_SOURCE/OVMF_VARS_SOURCE)" >&2
     missing=1
   fi
 
-  if [[ ! -e /dev/kvm ]]; then
-    echo "Missing /dev/kvm (KVM not available)" >&2
-    missing=1
-  else
-    if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+  if [[ "$SANDBOX_ACCEL" == "kvm" ]]; then
+    if [[ ! -e /dev/kvm ]]; then
+      echo "Missing /dev/kvm (KVM not available). Set SANDBOX_ACCEL=tcg to run emulated." >&2
+      missing=1
+    elif [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
       echo "No permission to use /dev/kvm (are you in the kvm group?)" >&2
+      echo "  sudo usermod -aG kvm $USER   # then start a new shell" >&2
+      echo "  or run with SANDBOX_ACCEL=tcg" >&2
       missing=1
     fi
   fi
@@ -278,9 +436,13 @@ ensure_packages() {
   if [[ "$missing" -ne 0 ]]; then
     cat >&2 <<'EOF'
 Install prerequisites:
-  sudo apt install -y curl pwgen openssh-client genisoimage qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy socat rsync python3
+  sudo apt install -y curl openssh-client xorriso qemu-system-x86 qemu-utils virtiofsd uidmap ovmf moreutils haproxy socat rsync python3
+
+  # OCI registry, system-wide...
   curl -L https://github.com/distribution/distribution/releases/download/v3.1.0/registry_3.1.0_linux_amd64.tar.gz -o /tmp/registry.tar.gz
-  tar -xzf /tmp/registry.tar.gz -C "/tmp" && sudo mv /tmp/registry /usr/local/bin/registry && sudo chmod +x /usr/local/bin/registry
+  tar -xzf /tmp/registry.tar.gz -C "/tmp" && sudo install -m 0755 /tmp/registry /usr/local/bin/registry
+  # ...or per-user, no sudo (the script also looks in ~/.local/bin/registry):
+  #   mkdir -p ~/.local/bin && tar -xzf /tmp/registry.tar.gz -C ~/.local/bin registry
 
 Ensure KVM is enabled:
   - BIOS/UEFI virtualization (Intel VT-x / AMD-V)
@@ -302,12 +464,90 @@ ensure_instance_dirs() {
 }
 
 ensure_uefi() {
-  if [[ ! -f "$OVMF_CODE_COPY" ]]; then
-    cp "$OVMF_CODE_SOURCE" "$OVMF_CODE_COPY"
+  local code vars
+
+  # A running QEMU maps these files into the guest, so rewriting them under it
+  # would corrupt its firmware and variable store.
+  if is_running qemu; then
+    return 0
   fi
-  if [[ ! -f "$OVMF_VARS_COPY" ]]; then
-    cp "$OVMF_VARS_SOURCE" "$OVMF_VARS_COPY"
+
+  if ! code="$(uefi_find_code)"; then
+    echo "ERROR: no UEFI firmware found. Debian/Ubuntu's 'ovmf' package provides" >&2
+    echo "       /usr/share/OVMF/OVMF_CODE_4M.fd + OVMF_VARS_4M.fd, or set" >&2
+    echo "       OVMF_CODE_SOURCE/OVMF_VARS_SOURCE to firmware files of your choice." >&2
+    exit 1
   fi
+  vars="$(uefi_find_vars)" || vars=""
+
+  _sync_firmware "$code" "$OVMF_CODE_COPY"
+  if [[ -n "$vars" ]]; then
+    _sync_firmware "$vars" "$OVMF_VARS_COPY"
+  else
+    # Only a combined image is available: it becomes the single writable drive.
+    rm -f "$OVMF_VARS_COPY"
+  fi
+}
+
+# Keep the private firmware copies in step with their sources rather than reusing
+# whatever is lying around: a leftover from a different firmware package (or from
+# an older release of this script) would otherwise boot every VM with the wrong
+# variable store.
+_sync_firmware() {
+  local src="$1" dest="$2"
+  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+    return 0
+  fi
+  cp -f -- "$src" "$dest"
+}
+
+# The -drive arguments that attach the firmware, one per line. Split images
+# (Debian/Ubuntu) want the code image read-only and the variable-store copy
+# writable; a combined image has to be attached writable as a single drive
+# instead. If EDK2 has no writable variable store it falls back to an 'NvVars'
+# file on the first filesystem it can write to, and a VM's firmware can see the
+# virtiofs share, so that file would end up in the user's project directory.
+uefi_pflash_args() {
+  if [[ -f "$OVMF_VARS_COPY" ]]; then
+    printf '%s\n' \
+      "-drive" "if=pflash,format=raw,readonly=on,file=$OVMF_CODE_COPY" \
+      "-drive" "if=pflash,format=raw,file=$OVMF_VARS_COPY"
+  else
+    printf '%s\n' "-drive" "if=pflash,format=raw,file=$OVMF_CODE_COPY"
+  fi
+}
+
+# Debian/Ubuntu split the firmware into CODE + VARS files under /usr/share/OVMF,
+# while Alpine/openSUSE ship a single combined OVMF.fd used for both pflash drives.
+uefi_find_code() {
+  local candidate
+  for candidate in \
+    "${OVMF_CODE_SOURCE:-}" \
+    /usr/share/OVMF/OVMF_CODE_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd \
+    /usr/share/qemu/OVMF_CODE_4M.fd \
+    /usr/share/edk2/ovmf/OVMF_CODE_4M.fd \
+    /usr/share/ovmf/OVMF_CODE.fd \
+    /usr/share/ovmf/OVMF.fd
+  do
+    [[ -n "$candidate" && -r "$candidate" ]] && { echo "$candidate"; return 0; }
+  done
+  return 1
+}
+
+uefi_find_vars() {
+  local candidate
+  for candidate in \
+    "${OVMF_VARS_SOURCE:-}" \
+    /usr/share/OVMF/OVMF_VARS_4M.fd \
+    /usr/share/OVMF/OVMF_VARS.fd \
+    /usr/share/qemu/OVMF_VARS_4M.fd \
+    /usr/share/edk2/ovmf/OVMF_VARS_4M.fd \
+    /usr/share/ovmf/OVMF_VARS.fd
+  do
+    [[ -n "$candidate" && -r "$candidate" ]] && { echo "$candidate"; return 0; }
+  done
+  return 1
 }
 
 ensure_ssh_key() {
@@ -324,21 +564,36 @@ download_base_image() {
   if [[ ! -f "$BASE_IMAGE" ]]; then
     echo "Downloading base image from $DOWNLOAD_IMAGE"
     curl -L --fail --progress-bar "$DOWNLOAD_IMAGE" -o "$BASE_IMAGE"
+    # "QFI\xfb" = qcow2 magic. Fail loudly instead of confusing qemu-img later.
+    if [[ "$(od -An -tx1 -N4 "$BASE_IMAGE" | tr -d ' ')" != "514649fb" ]]; then
+      echo "ERROR: $BASE_IMAGE is not a qcow2 image (unexpected magic)." >&2
+      echo "       Delete it and re-run 'agent-sandbox build'." >&2
+      rm -f "$BASE_IMAGE"
+      exit 1
+    fi
     chmod -w "$BASE_IMAGE"
   fi
 }
 
 create_cloud_init() {
   local extra_cmd="$1"
+  local version="$2"
+  local root_password="$3"
 
   local custom_ca_config=""
   if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
-    custom_ca_config="bootcmd:\n  - [ cloud-init-per, instance, setup-ca, sh, -c, \"SSL_NO_VERIFY=1 apk add --no-cache --no-check-certificate ca-certificates\" ]\n\n"
+    custom_ca_config="bootcmd:\n  - [ cloud-init-per, instance, setup-ca, sh, -c, \"update-ca-certificates\" ]\n\n"
     custom_ca_config+="ca_certs:\n  trusted:"
     for cert in /usr/local/share/ca-certificates/*.crt; do
       custom_ca_config+="\n    - |\n$(sed 's/^/      /' "$cert")"
     done
   fi
+
+  # EXTRA_PACKAGES is intentionally word-split into a YAML sequence.
+  local extra_packages=""
+  for pkg in $EXTRA_PACKAGES; do
+    extra_packages+="  - $pkg"$'\n'
+  done
 
   cat >"$USER_DATA" <<EOF
 #cloud-config
@@ -346,35 +601,77 @@ create_cloud_init() {
 $(echo -e "$custom_ca_config")
 
 package_update: true
+package_upgrade: false
+apt:
+  conf: |
+    Acquire::Retries "5";
+    Acquire::http::Pipeline-Depth "0";
+    Apt::Install-Recommends "false";
+    Apt::AutoRemove::RecommendsImportant "false";
 packages:
-  - bash
-  - vim
   - git
-  - curl
-  - ripgrep
-  - build-base
-  - python3-dev
-  - py3-pip
-  - npm
-  - docker
-  - docker-cli
-  - docker-cli-compose
-  - containerd
+  - rsync
   - nftables
+  - ripgrep
+  - vim-tiny
+  - apparmor
+  - docker.io
+$(echo -e "$extra_packages")
+# Nothing else. The golden image stays lean: no build toolchain, no python3-dev,
+# no node. Add what a project needs with EXTRA_PACKAGES="build-essential python3-pip".
+
+# Neutralise the image's built-in default user; $VM_AGENT_USER is defined explicitly below.
+system_info:
+  default_user:
+    name: ubuntu
+    lock_passwd: true
+    shell: /usr/sbin/nologin
+    groups: []
+
+users:
+  - name: root
+    lock_passwd: false
+    ssh_authorized_keys:
+      - $(cat "$SSH_PUB")
+  - name: $VM_AGENT_USER
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - $(cat "$SSH_PUB")
 
 runcmd:
-  - set -xeo pipefail
-  # Install agent: opencode
-  - npm install -g opencode-linux-x64-musl
-  - ln -s /usr/local/lib/node_modules/opencode-linux-x64-musl/bin/opencode /usr/local/bin/opencode
-  # Install agent: qwen
-  - npm install -g @qwen-code/qwen-code@latest
-  # Install agent: claude
-  - wget -O /etc/apk/keys/claude-code.rsa.pub https://downloads.claude.ai/keys/claude-code.rsa.pub
-  - echo "https://downloads.claude.ai/claude-code/apk/stable" >> /etc/apk/repositories
-  - apk add claude-code
-  # Enable docker service
-  - rc-update add docker default
+  # cloud-init runs this file with /bin/sh, which is dash on Ubuntu, so stay
+  # POSIX: 'set -o pipefail' is a bashism that would abort the whole script.
+  - set -eux
+  # --- The one agent: OpenCode V2 (glibc build, no node/npm runtime needed) ---
+  - curl -fsSL --retry 5 -o /tmp/opencode.tgz "https://registry.npmjs.org/@opencode%2f$OPENCODE_TARGET/-/$OPENCODE_TARGET-$version.tgz"
+  - tar -xzf /tmp/opencode.tgz -C /tmp
+  - install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode
+  - rm -rf /tmp/opencode.tgz /tmp/package
+  - opencode --version
+  # --- Slim down the base image ---
+  - apt-get purge -y --auto-remove snapd || true
+  - rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd /etc/systemd/system/snapd.service.d /etc/apparmor.d/snap*
+  - apt-get autoremove --purge -y || true
+  - apt-get clean
+  - rm -rf /var/lib/apt/lists/*
+  # --- Keep the image's own default user unusable, if the base image has one ---
+  - usermod -L -s /usr/sbin/nologin ubuntu || true
+  # --- Pin the agent account to the ids virtiofsd maps onto the host user ---
+  # cloud-init assigns the first free ids, which vary by base image; the shared
+  # workdir only works when the guest ids match virtiofsd's uid/gid maps.
+  - getent group $VM_AGENT_USER || groupadd -g $VM_AGENT_GID $VM_AGENT_USER
+  - groupmod -g $VM_AGENT_GID $VM_AGENT_USER
+  - usermod -u $VM_AGENT_UID $VM_AGENT_USER
+  - chown -R $VM_AGENT_UID:$VM_AGENT_GID /home/$VM_AGENT_USER
+  - id $VM_AGENT_USER
+  - test "\$(id -u $VM_AGENT_USER)" = "$VM_AGENT_UID" && test "\$(id -g $VM_AGENT_USER)" = "$VM_AGENT_GID"
+  # --- Docker, reachable by the agent user through the socket group ---
+  # The group is created by the docker.io package, so this runs after the
+  # package install step of the same cloud-init pass.
+  - getent group docker || groupadd -r docker
+  - usermod -aG docker $VM_AGENT_USER
+  - systemctl enable docker
   # Install docker wrapper to force images be pulled from local registry
   - mv "\$(which docker)" /usr/bin/docker.real
   - curl -L https://github.com/adiffpirate/docker-wrapper-custom-registry/raw/refs/heads/main/docker.py -o /usr/local/bin/docker
@@ -383,32 +680,29 @@ runcmd:
   - sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub
   - echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
   - grub-mkconfig -o /boot/grub/grub.cfg
+  # --- Share the workdir automatically, even after a guest reboot ---
+  # 'nofail' keeps booting alive if the virtiofs device is ever absent.
+  - mkdir -p /home/$VM_AGENT_USER/workdir
+  - grep -q 'virtiofs' /etc/fstab || echo 'workdir /home/$VM_AGENT_USER/workdir virtiofs nofail 0 0' >> /etc/fstab
   # Disable cloud-init for future boots
   - touch /etc/cloud/cloud-init.disabled
+  - sync
   # Run extra cmd
   - bash -c '$extra_cmd'
-
-users:
-  - name: root
-    ssh_authorized_keys:
-      - $(cat "$SSH_PUB")
-  - name: $VM_AGENT_USER
-    groups: [docker]
-    shell: /bin/bash
-    ssh_authorized_keys:
-      - $(cat "$SSH_PUB")
-  - name: alpine
-    shell: /sbin/nologin
+  # Reaching this line means every step above succeeded. 'build' greps the
+  # serial log for this marker; the guest console is the serial port.
+  - echo $PROVISION_SENTINEL > /dev/console
 
 chpasswd:
+  expire: false
   list: |
-    root:$(pwgen --capitalize --numerals --symbols --secure 50 1)
+    root:$root_password
     $VM_AGENT_USER:$VM_AGENT_USER
 
 ssh_pwauth: false
 
 write_files:
-  - path: /etc/bash/bashrc
+  - path: /etc/bash.bashrc
     append: true
     content: |
       if [ -f /etc/environment ]; then
@@ -421,33 +715,40 @@ write_files:
     content: |
       PermitRootLogin prohibit-password
       PasswordAuthentication no
-      ChallengeResponseAuthentication no
-      UsePAM no
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+      AuthenticationMethods publickey
+      AllowUsers $VM_AGENT_USER root
+      MaxAuthTries 3
+      LoginGraceTime 20
+      AllowTcpForwarding no
+      PermitTunnel no
+      X11Forwarding no
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+  - path: /etc/systemd/journald.conf.d/00-volatile.conf
+    permissions: '0644'
+    content: |
+      [Journal]
+      Storage=volatile
+      SystemMaxUse=64M
   - path: /etc/docker/daemon.json
     content: |
       {
         "insecure-registries": ["$REGISTRY_ENDPOINT"]
       }
 
+# Always power off: 'build' decides success from the marker in the serial log.
+# A condition here would leave QEMU running forever on any cloud-init warning,
+# because the guest logs always contain the word "Error".
 power_state:
   mode: poweroff
-  message: "========== CLOUD INIT SUCCESS === POWERING OFF =========="
-  condition: sh -c '! cat /var/log/cloud-init*.log | grep -q -e "ERROR" -e "Error"'
+  message: "agent-sandbox: powering off the provisioning VM"
 
 final_message: |
-  --------------------------------------------------------------------------------------------
-  |                                 CLOUD INIT FINISHED                                      |
-  --------------------------------------------------------------------------------------------
-  |   IF YOU ARE SEEING THE LOGIN PROMPT IS BECAUSE SOMETHING WENT WRONG ON CLOUD-INIT       |
-  |   INVESTIGATE THE LOGS: https://docs.cloud-init.io/en/latest/reference/user_files.html   |
-  --------------------------------------------------------------------------------------------
-
-  [TIP] SEE LOGS WITH:      cat /var/log/cloud-init*.log | grep -i error
-  [TIP] SEE STATUS WITH:    cloud-init status -l
-  [TIP] SSH IF AVAILABLE:   agent-sandbox ssh root
-  [TIP] IF NOT LOGIN WITH:  user=$VM_AGENT_USER pass=$VM_AGENT_USER
-
-  Good luck :)
+  agent-sandbox: cloud-init reached its final stage.
+  If "$PROVISION_SENTINEL" is missing from the console log, provisioning failed:
+  investigate the cloud-init logs shown above.
 EOF
 
   cat >"$META_DATA" <<EOF
@@ -455,33 +756,117 @@ instance-id: agent-sandbox
 local-hostname: agent-sandbox
 EOF
 
-  genisoimage -output "$SEED_ISO" -volid cidata -rock "$USER_DATA" "$META_DATA"
+  build_seed_iso
 }
 
 build_golden_image() {
+  local serial_log="$SANDBOX_HOME/build-serial.log"
+
   qemu-img create -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$GOLDEN_IMAGE" $VM_DISK_SIZE
 
-  qemu-system-x86_64 \
-    --enable-kvm \
-    -cpu host -smp $VM_THREADS -m $VM_MEMORY_RAM \
-    -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE_COPY" \
-    -drive if=pflash,format=raw,file="$OVMF_VARS_COPY" \
-    -drive file="$GOLDEN_IMAGE",if=virtio,format=qcow2 \
-    -drive file="$SEED_ISO",format=raw \
-    -device virtio-net-pci,netdev=net0 \
+  # Headless: cloud-init talks to us over the serial console, and the guest
+  # powers itself off at the end of provisioning (see power_state in the seed).
+  echo "Provisioning the golden image... cloud-init console log: $serial_log"
+  local -a boot=() pflash=()
+  if have_cmd timeout; then
+    boot=(timeout "$BUILD_TIMEOUT")
+  fi
+  mapfile -t pflash < <(uefi_pflash_args)
+  if [[ ${#pflash[@]} -eq 0 ]]; then
+    echo "ERROR: no UEFI firmware to attach to the VM." >&2
+    exit 1
+  fi
+  boot+=(
+    qemu-system-x86_64
+    -accel "$SANDBOX_ACCEL"
+    -cpu "$VM_CPU_MODEL" -smp $VM_THREADS -m $VM_MEMORY_RAM
+    -display none -monitor none -serial "file:$serial_log"
+    -no-reboot
+    "${pflash[@]}"
+    -drive file="$GOLDEN_IMAGE",if=virtio,format=qcow2
+    -drive file="$SEED_ISO",format=raw
+    -device virtio-net-pci,netdev=net0
     -netdev user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22
+  )
 
-  echo ""
+  local rc=0
+  # Run from the sandbox state dir: QEMU takes relative paths and any stray file
+  # (a firmware variable fallback, for instance) from its working directory, and
+  # that directory would otherwise be the user's project, which is also what the
+  # VM gets to share. Every path passed here is absolute.
+  ( cd "$SANDBOX_HOME" && "${boot[@]}" ) || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    echo "ERROR: provisioning timed out after ${BUILD_TIMEOUT}s (guest never powered off)." >&2
+    echo "       Raise BUILD_TIMEOUT, or read $serial_log for where it stopped." >&2
+    rm -f "$GOLDEN_IMAGE"
+    exit 1
+  elif [[ $rc -ne 0 ]]; then
+    echo "ERROR: qemu exited with status $rc during provisioning." >&2
+    rm -f "$GOLDEN_IMAGE"
+    exit 1
+  fi
+
+  # qemu exiting cleanly is not enough: cloud-init can fail and still shut down.
+  if ! grep -q "$PROVISION_SENTINEL" "$serial_log" 2>/dev/null; then
+    echo "ERROR: cloud-init did not finish provisioning the image." >&2
+    echo "       Look for 'Failed to run' / 'Invalid config' lines in:" >&2
+    echo "         $serial_log" >&2
+    echo "Last console messages:" >&2
+    tail -n 25 "$serial_log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/^/  /' >&2
+    rm -f "$GOLDEN_IMAGE"
+    exit 1
+  fi
+
+  echo
+  echo "Provisioning completed cleanly (found '$PROVISION_SENTINEL')."
   echo "Golden image built at $GOLDEN_IMAGE"
+  qemu-img info "$GOLDEN_IMAGE" | sed -n 's/^/  /p'
+}
+
+# 'build' has to start from a clean slate, but it keeps the (large) downloaded
+# base image: re-fetching 250 MB on every rebuild is pure waste. Use 'purge' to
+# throw that away too.
+_clean_build_artefacts() {
+  local instance_dir
+  for instance_dir in "$SANDBOX_HOME"/instances/*/; do
+    if [[ -d "$instance_dir" ]]; then
+      INSTANCE_HOME="$instance_dir"
+      _stop
+    fi
+  done
+  rm -f "$GOLDEN_IMAGE" "$SESSION_IMAGE" "$SEED_ISO" "$USER_DATA" "$META_DATA" \
+        "$OVMF_CODE_COPY" "$OVMF_VARS_COPY" "$IMAGE_STAMP" \
+        "$SANDBOX_HOME/build-serial.log"
+  sleep 1
 }
 
 _build() {
   local extra_cmd="$1"
-  _purge
+  _clean_build_artefacts
   ensure_prereqs
   download_base_image
-  create_cloud_init "$extra_cmd"
+
+  local version root_password
+  version="$(resolve_opencode_version)"
+  root_password="$(random_password)"
+
+  echo
+  echo "Base image : $DOWNLOAD_IMAGE"
+  echo "OpenCode   : $OPENCODE_TARGET $version"
+  echo "Packages   : git rsync nftables ripgrep vim-tiny apparmor docker.io ${EXTRA_PACKAGES}"
+  echo "Root pass  : $root_password"
+  echo "             (SSH is key-only; this is for the serial console only)"
+  echo
+
+  create_cloud_init "$extra_cmd" "$version" "$root_password"
   build_golden_image
+
+  {
+    printf 'base_image=%s\n' "$DOWNLOAD_IMAGE"
+    printf 'opencode=%s %s\n' "$OPENCODE_TARGET" "$version"
+    printf 'built=%s\n' "$(date -Is)"
+  } > "$IMAGE_STAMP"
+
   clean_session_files
 }
 
@@ -515,10 +900,11 @@ start_virtiofsd() {
     --socket-path="$FS_SOCK" \
     --shared-dir="$WORKDIR" \
     --sandbox namespace \
-    --uid-map=:1001:$(id -u):1: \
-    --gid-map=:1002:$(id -g):1: \
+    --uid-map=":${VM_AGENT_UID}:$(id -u):1:" \
+    --gid-map=":${VM_AGENT_GID}:$(id -g):1:" \
     $ro_flag \
     >"$VIRTIOFSD_LOG" 2>&1 &
+  echo $! > "$VIRTIOFSD_PIDFILE"
 
   local tries=50
   while [[ ! -S "$FS_SOCK" ]]; do
@@ -529,6 +915,19 @@ start_virtiofsd() {
       exit 1
     fi
   done
+}
+
+# Address HAProxy publishes the guest's OpenCode port on. It follows the interface
+# the host uses to reach the configured LLM, so pointing --local-llm-host at a LAN
+# address publishes OpenCode on the LAN as well. Otherwise the port stays on
+# loopback: OPENCODE_BIND_IP=0.0.0.0 (or a chosen address) is the explicit opt-in.
+opencode_bind_address() {
+  local bind_ip="${OPENCODE_BIND_IP:-}"
+  if [[ -z "$bind_ip" ]] && have_cmd ip; then
+    bind_ip="$(ip route get "$LOCAL_LLM_HOST" 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)"
+  fi
+  [[ -z "$bind_ip" ]] && bind_ip="127.0.0.1"
+  echo "$bind_ip"
 }
 
 start_haproxy(){
@@ -544,14 +943,8 @@ start_haproxy(){
 
   echo "Starting haproxy (LLM :$HAPROXY_LISTEN_PORT, OpenCode :$OPENCODE_WEB_PORT)..."
 
-  # Prefer the host address used to reach the configured LLM. This keeps
-  # OpenCode LAN access on the LAN interface instead of exposing it on every
-  # host interface. Fall back to 0.0.0.0 if route discovery is unavailable.
-  local opencode_bind_ip="${OPENCODE_BIND_IP:-}"
-  if [[ -z "$opencode_bind_ip" ]] && have_cmd ip; then
-    opencode_bind_ip="$(ip route get "$LOCAL_LLM_HOST" 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
-  fi
-  [[ -z "$opencode_bind_ip" ]] && opencode_bind_ip="0.0.0.0"
+  local opencode_bind_ip
+  opencode_bind_ip="$(opencode_bind_address)"
 
   cat > "$HAPROXY_CONFIG" <<EOF
 global
@@ -629,7 +1022,7 @@ http:
   addr: :$REGISTRY_LISTEN_PORT
 EOF
 
-  nohup registry serve "$REGISTRY_CONFIG" > "$REGISTRY_LOG" 2>&1 &
+  nohup "$REGISTRY_BIN" serve "$REGISTRY_CONFIG" > "$REGISTRY_LOG" 2>&1 &
   local pid=$!
   echo $pid > "$REGISTRY_PIDFILE"
 
@@ -801,6 +1194,33 @@ def pump(src, dst):
         except OSError:
             pass
 
+def qname(data):
+    """Return (name, offset_after_qname) for the first question in a DNS packet."""
+    labels = []
+    i = 12
+    while i < len(data):
+        length = data[i]
+        if length == 0:
+            i += 1
+            break
+        if length & 0xC0:            # compression pointer: not expected in queries
+            return None, None
+        labels.append(data[i + 1:i + 1 + length].decode('ascii', errors='ignore'))
+        i += 1 + length
+    if not labels:
+        return None, None
+    return '.'.join(labels).lower(), i
+
+def nxdomain_response(query):
+    """Echo the question back with rcode 3 (NXDOMAIN) and no answers."""
+    header = query[:2] + b'\x81\x83' + query[4:6] + b'\x00\x00\x00\x00\x00\x00'
+    return header + query[12:]
+
+def nodata_response(query):
+    """Rcode 0 with no answers: the name exists but has no record of that type."""
+    header = query[:2] + b'\x81\x80' + query[4:6] + b'\x00\x00\x00\x00\x00\x00'
+    return header + query[12:]
+
 def handle_dns(conn, data):
     """DNS: data = b'DNS' + 2-byte-len + query (may need more reads)."""
     try:
@@ -814,6 +1234,22 @@ def handle_dns(conn, data):
             if not chunk:
                 break
             query += chunk
+
+        name, qoff = qname(query) if len(query) >= 12 else (None, None)
+        if name and not is_allowed(name):
+            # Fail fast instead of letting the client dial a connection the
+            # HTTP/HTTPS proxy will drop anyway.
+            conn.sendall(struct.pack('>H', len(nxdomain_response(query))) + nxdomain_response(query))
+            return
+
+        # Only IPv4 gets DNAT'ed to this proxy inside the VM, so an IPv6 address
+        # would be a dead end: answer AAAA with NODATA and let the client use A.
+        if name and qoff is not None and len(query) >= qoff + 2:
+            if struct.unpack('>H', query[qoff:qoff + 2])[0] == 28:  # AAAA
+                nod = nodata_response(query)
+                conn.sendall(struct.pack('>H', len(nod)) + nod)
+                return
+
         resp = udp_resolve(query)
         conn.sendall(struct.pack('>H', len(resp)) + resp)
     except Exception:
@@ -824,12 +1260,10 @@ def handle_dns(conn, data):
 def handle_http_https(conn, data):
     """HTTP/HTTPS: DNAT'd raw connection from VM."""
     try:
-        # Read enough to identify protocol
-        while len(data) < 512:
-            chunk = conn.recv(4096)
-            if not chunk:
-                return
-            data += chunk
+        # Read only until the first complete request unit is buffered. Reading a
+        # fixed number of bytes would block on the client's reply and drop the
+        # connection (short curl/npm requests are under 512 bytes).
+        while True:
             if data[0] == 0x16:
                 if len(data) >= 5:
                     rl = struct.unpack('>H', data[3:5])[0]
@@ -838,6 +1272,12 @@ def handle_http_https(conn, data):
             else:
                 if b'\r\n\r\n' in data:
                     break
+            if len(data) >= 16384:
+                break
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            data += chunk
 
         if data[0] == 0x16:
             hostname = parse_sni(data)
@@ -923,98 +1363,293 @@ PYEOF
 # VM FIREWALL (nftables REDIRECT + transparent proxy, runs inside VM via SSH)
 #--------------------------------------------------------------------------------
 
-setup_vm_firewall() {
-  echo "  Setting up in-VM firewall (nftables DNAT + DNS helper)..."
+# Guest-side network policy. Everything that touches the guest kernel is done by
+# one generated shell script instead of a long '&& ... || true' chain over SSH:
+# such chains skip every later step after the first failure, which used to leave
+# the VM with a pinned /etc/resolv.conf and no nftables rules at all.
+guest_firewall_script() {
+  cat > "$INSTANCE_HOME/agent-sandbox-firewall.sh" <<GUESTFW
+#!/bin/sh
+# Installed by agent-sandbox. apply | remove | status
+set -eu
 
-  # Write the tiny DNS helper locally
+NFT_FILE=/etc/sandbox/firewall.nft
+DNS_UNIT=dns-proxy
+FW_UNIT=sandbox-firewall
+
+flush() {
+  nft delete table ip sandbox_proxy >/dev/null 2>&1 || true
+  nft delete table ip sandbox_filter >/dev/null 2>&1 || true
+}
+
+apply() {
+  # QEMU's user-net lease hands out an address but no IPv4 router, and without a
+  # default route the kernel's routing check fails before the DNAT below can
+  # rewrite the destination, so every whitelisted connection would die. slirp
+  # runs with restrict=on, so this route cannot reach the internet by itself.
+  IFACE=$(ip -o -4 route show to exact 10.0.2.0/24 | awk '{print $5; exit}')
+  [ -n "\$IFACE" ] || IFACE=ens3
+  ip route replace default via 10.0.2.2 dev "\$IFACE" || {
+    echo "agent-sandbox-firewall: cannot set a default route via 10.0.2.2 on \$IFACE" >&2
+    exit 1
+  }
+
+  # Fail closed: a partially loaded ruleset is no policy at all.
+  flush
+  nft -f "\$NFT_FILE"
+  nft list table ip sandbox_filter >/dev/null
+  nft list table ip sandbox_proxy >/dev/null
+
+  systemctl enable "\$DNS_UNIT" "\$FW_UNIT"
+
+  # Take DNS away from systemd-resolved so nothing can reopen a path around the
+  # whitelist proxy by rewriting the resolver config.
+  systemctl stop systemd-resolved >/dev/null 2>&1 || true
+  systemctl mask systemd-resolved >/dev/null 2>&1 || true
+  chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
+  rm -f /etc/resolv.conf
+  printf 'nameserver 127.0.0.1\\n' > /etc/resolv.conf
+  chmod 0644 /etc/resolv.conf
+  chattr +i /etc/resolv.conf >/dev/null 2>&1 || true
+  lsattr /etc/resolv.conf
+}
+
+remove() {
+  IFACE=$(ip -o -4 route show to exact 10.0.2.0/24 | awk '{print $5; exit}')
+  [ -n "\$IFACE" ] || IFACE=ens3
+  ip route replace default via 10.0.2.2 dev "\$IFACE" 2>/dev/null || true
+  systemctl disable --now "\$DNS_UNIT" "\$FW_UNIT" >/dev/null 2>&1 || true
+  flush
+  systemctl unmask systemd-resolved >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl restart systemd-resolved >/dev/null 2>&1 || true
+  chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
+  rm -f /etc/resolv.conf
+
+  # Hand the VM back a resolver config instead of leaving /etc/resolv.conf
+  # missing. QEMU's user-mode stack only answers name queries when its own host
+  # side resolver is reachable from slirp, which a systemd-resolved stub on the
+  # host is not, so without a whitelist this file is a placeholder: outbound DNS
+  # is only guaranteed through the whitelist proxy.
+  DNS=\$(sed -n 's/^DNS=\([^ ]*\).*/\1/p' /run/systemd/netif/leases/* 2>/dev/null | head -1)
+  [ -n "\$DNS" ] || DNS=10.0.2.3
+  printf 'nameserver %s\\n' "\$DNS" > /etc/resolv.conf
+  chmod 0644 /etc/resolv.conf
+  lsattr /etc/resolv.conf 2>/dev/null || true
+}
+
+status() {
+  nft list ruleset
+  lsattr /etc/resolv.conf 2>/dev/null || true
+  systemctl is-active "\$DNS_UNIT" "\$FW_UNIT"
+}
+
+case "\${1:-apply}" in
+  apply)  apply ;;
+  remove) remove ;;
+  status) status ;;
+  *) echo "usage: \$0 apply|remove|status" >&2; exit 2 ;;
+esac
+GUESTFW
+}
+
+# Copy a generated file into the VM and give it the mode it needs, because scp
+# does not preserve the local one.
+copy_to_vm() {
+  local src="$1" dest="$2" mode="$3"
+  if ! scp -i "$SSH_KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null "$src" "root@127.0.0.1:$dest"; then
+    echo "ERROR: could not copy $(basename "$src") into the VM." >&2
+    exit 1
+  fi
+  if ! _ssh root "chmod $mode '$dest'" >/dev/null; then
+    echo "ERROR: could not set permissions on $dest in the VM." >&2
+    exit 1
+  fi
+}
+
+setup_vm_firewall() {
+  echo "  Setting up in-VM firewall (nftables DNAT + DNS forwarder + input policy)..."
+
+  # --- In-VM DNS forwarder: UDP :53 -> TCP to the host proxy ("DNS" magic) ---
+  # No forking: systemd supervises it, so a crash is visible in the journal.
   cat > "$INSTANCE_HOME/dns_proxy.py" <<'DNSPROXY'
 #!/usr/bin/env python3
-"""In-VM DNS helper: UDP :53 -> TCP to host proxy (with DNS magic prefix)."""
-import socket, struct, threading, sys, os
+"""In-VM DNS helper: UDP :53 -> TCP to the host whitelist proxy."""
+import socket, struct, sys, threading
 
+# Args: <host-proxy port> [host-proxy address] [listen port]
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 14000
-
-# Daemonize
-if os.fork() > 0:
-    sys.exit(0)
-os.setsid()
-if os.fork() > 0:
-    sys.exit(0)
+HOST = sys.argv[2] if len(sys.argv) > 2 else "10.0.2.100"
+LISTEN_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 53
 
 def fwd(q):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(5)
-    s.connect(("10.0.2.100", PORT))
-    s.sendall(b"DNS" + struct.pack(">H", len(q)) + q)
-    hdr = b""
-    while len(hdr) < 2:
-        hdr += s.recv(2 - len(hdr))
-    n = struct.unpack(">H", hdr)[0]
-    r = b""
-    while len(r) < n:
-        r += s.recv(n - len(r))
-    s.close()
-    return r
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(5)
+        s.connect((HOST, PORT))
+        s.sendall(b"DNS" + struct.pack(">H", len(q)) + q)
+        hdr = b""
+        while len(hdr) < 2:
+            chunk = s.recv(2 - len(hdr))
+            if not chunk:
+                return b""
+            hdr += chunk
+        n = struct.unpack(">H", hdr)[0]
+        r = b""
+        while len(r) < n:
+            chunk = s.recv(n - len(r))
+            if not chunk:
+                return b""
+            r += chunk
+        return r
 
-def h(sock, d, a):
+def handle(sock, data, addr):
     try:
-        r = fwd(d)
-        if r:
-            sock.sendto(r, a)
+        answer = fwd(data)
+        if answer:
+            sock.sendto(answer, addr)
     except Exception:
         pass
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("0.0.0.0", 53))
+s.bind(("0.0.0.0", LISTEN_PORT))
 while True:
-    d, a = s.recvfrom(4096)
-    threading.Thread(target=h, args=(s, d, a), daemon=True).start()
+    data, addr = s.recvfrom(4096)
+    threading.Thread(target=handle, args=(s, data, addr), daemon=True).start()
 DNSPROXY
 
-  # Write the OpenRC init script locally
-  cat > "$INSTANCE_HOME/dns_proxy.init" <<INIEOF
-#!/sbin/openrc-run
-name=dns_proxy
-command=/usr/bin/python3
-command_args="/usr/local/bin/dns_proxy.py $HOST_PROXY_PORT"
-command_user=root
-INIEOF
+  # --- systemd unit for the forwarder ---
+  cat > "$INSTANCE_HOME/dns-proxy.service" <<UNIT
+[Unit]
+Description=agent-sandbox DNS forwarder (127.0.0.1:53 -> host proxy)
 
-  # Write the nftables ruleset locally (avoids brace-quoting over SSH)
-  cat > "$INSTANCE_HOME/sandbox_proxy.nft" <<NFT
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/dns_proxy.py $HOST_PROXY_PORT
+Restart=always
+RestartSec=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  # --- re-apply the policy after a VM reboot so it never silently disappears ---
+  # Must run *after* the interface has its address: the policy needs the default
+  # route to exist before the DNAT can be used, so an early (network-pre) start
+  # makes the unit fail and leaves the VM without any policy.
+  cat > "$INSTANCE_HOME/sandbox-firewall.service" <<UNIT
+[Unit]
+Description=agent-sandbox network policy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/agent-sandbox-firewall.sh apply
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  # --- nftables: DNAT to the host proxy + default-deny input policy ---
+  # Written locally to avoid brace-quoting problems over SSH.
+  cat > "$INSTANCE_HOME/firewall.nft" <<NFT
 table ip sandbox_proxy {
   chain out {
-    type nat hook output priority -1
+    type nat hook output priority -1; policy accept;
     ip daddr 10.0.2.0/24 return
     ip daddr 127.0.0.1 return
     tcp dport 80 dnat to 10.0.2.100:$HOST_PROXY_PORT
     tcp dport 443 dnat to 10.0.2.100:$HOST_PROXY_PORT
   }
 }
+
+# Default-deny for anything arriving at the VM. Outbound connections (LLM proxy,
+# registry, host proxy, Docker pulls through the local registry) are covered by
+# "ct state established" replies, and container traffic leaving through
+# FORWARD is untouched.
+table ip sandbox_filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    iif lo accept
+    ct state established,related accept
+    ct state invalid drop
+
+    # DHCP renew on the slirp interface (nft needs 'udp' twice here).
+    udp sport 67 udp dport 68 accept
+
+    # Docker bridge DNS helper only.
+    ip saddr 172.16.0.0/12 udp dport 53 accept
+    ip saddr 172.16.0.0/12 tcp dport 53 accept
+
+    # QEMU user-mode forwarding arrives from the slirp gateway (10.0.2.2):
+    # SSH, plus the OpenCode port that HAProxy on the host connects to.
+    ip saddr 10.0.2.2 tcp dport 22 accept
+    ip saddr 10.0.2.2 tcp dport $OPENCODE_VM_PORT accept
+  }
+}
 NFT
 
-  # Copy all files into VM
-  local scp_opts="-i $SSH_KEY -P $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-  scp $scp_opts "$INSTANCE_HOME/dns_proxy.py" "root@127.0.0.1:/usr/local/bin/dns_proxy.py" 2>/dev/null
-  scp $scp_opts "$INSTANCE_HOME/dns_proxy.init" "root@127.0.0.1:/etc/init.d/dns_proxy" 2>/dev/null
-  scp $scp_opts "$INSTANCE_HOME/sandbox_proxy.nft" "root@127.0.0.1:/tmp/sandbox_proxy.nft" 2>/dev/null
+  guest_firewall_script
 
-  # Apply: nftables from file + DNS service + resolv.conf
-  _ssh root "
-    set -e
-    && nft delete table ip sandbox_proxy 2>/dev/null || true
-    && nft -f /tmp/sandbox_proxy.nft
-    && ip route add default via 10.0.2.2
-    && rc-service dhcpcd stop 2>/dev/null || pkill dhcpcd 2>/dev/null || true
-    && sleep 0.3
-    && printf 'nameserver 127.0.0.1' > /etc/resolv.conf
-    && chmod 444 /etc/resolv.conf
-    && chmod +x /etc/init.d/dns_proxy
-    && rc-service dns_proxy start
-  "
+  # --- Copy the generated files into the VM ---
+  _ssh root "install -d -m 0755 /etc/sandbox" >/dev/null
+  copy_to_vm "$INSTANCE_HOME/dns_proxy.py" /usr/local/bin/dns_proxy.py 0755
+  copy_to_vm "$INSTANCE_HOME/dns-proxy.service" /etc/systemd/system/dns-proxy.service 0644
+  copy_to_vm "$INSTANCE_HOME/sandbox-firewall.service" /etc/systemd/system/sandbox-firewall.service 0644
+  copy_to_vm "$INSTANCE_HOME/firewall.nft" /etc/sandbox/firewall.nft 0644
+  copy_to_vm "$INSTANCE_HOME/agent-sandbox-firewall.sh" /usr/local/bin/agent-sandbox-firewall.sh 0755
 
-  echo "  VM firewall active: nftables DNAT -> host proxy | DNS via 127.0.0.1"
+  # --- Apply inside the guest through systemd ---
+  # Letting the unit run the script (instead of calling it over SSH) means the
+  # unit state matches reality and the exact same code path runs on a VM reboot.
+  if ! _ssh root "systemctl daemon-reload && systemctl restart sandbox-firewall && systemctl restart dns-proxy && systemctl is-active dns-proxy sandbox-firewall"; then
+    echo "ERROR: could not apply the in-VM network policy." >&2
+    echo "       Refusing to start the agent with no firewall in place." >&2
+    echo "       Ruleset that failed: $INSTANCE_HOME/firewall.nft" >&2
+    exit 1
+  fi
+
+  echo "  VM firewall active: DNAT -> host proxy | input policy drop | DNS pinned to 127.0.0.1"
+}
+
+# Undo the in-VM lockdown when the instance runs without a whitelist, so a
+# previously locked-down session cannot stay half-enforced.
+teardown_vm_firewall() {
+  # Only worth a round trip if a previous run actually locked this VM down.
+  if ! ssh -q -i "$SSH_KEY" -p "$SSH_PORT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "root@127.0.0.1" "test -x /usr/local/bin/agent-sandbox-firewall.sh" >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "  Clearing in-VM firewall (restrict-network off or no whitelist)..."
+
+  # The copy inside the VM may have been installed by an older release of this
+  # script, and undoing the lockdown with a stale version can leave the guest
+  # half-configured (an old remove() deleted /etc/resolv.conf without putting a
+  # resolver back). Refresh the script, then let it undo its own work.
+  guest_firewall_script
+  if scp -i "$SSH_KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no \
+       -o UserKnownHostsFile=/dev/null "$INSTANCE_HOME/agent-sandbox-firewall.sh" \
+       "root@127.0.0.1:/usr/local/bin/agent-sandbox-firewall.sh" >/dev/null 2>&1; then
+    _ssh root "chmod 0755 /usr/local/bin/agent-sandbox-firewall.sh" >/dev/null || true
+  else
+    echo "  WARNING: could not refresh the policy script in the VM," >&2
+    echo "           using the version already installed there." >&2
+  fi
+
+  _ssh root "/usr/local/bin/agent-sandbox-firewall.sh remove" || \
+    echo "  WARNING: in-VM policy removal reported an error" >&2
 }
 
 #--------------------------------------------------------------------------------
@@ -1029,26 +1664,43 @@ start_qemu() {
 
   echo "Starting QEMU/KVM..."
 
-  qemu-system-x86_64 \
-    -name "$VM_NAME" \
-    --enable-kvm \
-    -cpu host -smp $VM_THREADS -m $VM_MEMORY_RAM \
-    -display "none" -monitor "none" -serial "file:$QEMU_LOG" \
-    -daemonize -pidfile "$QEMU_PIDFILE" \
-    \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE_COPY" \
-    -drive "if=pflash,format=raw,file=$OVMF_VARS_COPY" \
-    \
-    -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
-    \
-    -device "virtio-net-pci,netdev=host" \
-    -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_VM_PORT-:$OPENCODE_VM_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:$HOST_PROXY_PORT-cmd:socat - TCP:127.0.0.1:$HOST_PROXY_PORT" \
-    \
-    -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
-    -numa "node,memdev=mem" \
-    \
-    -chardev "socket,id=fs0,path=$FS_SOCK" \
-    -device "vhost-user-fs-pci,chardev=fs0,tag=workdir"
+  # Run QEMU from the instance directory so anything it leaves behind at a
+  # relative path lands in the sandbox state dir rather than in the user's
+  # project, which is the directory the VM shares.
+  local rc=0
+  local -a pflash=()
+  mapfile -t pflash < <(uefi_pflash_args)
+  if [[ ${#pflash[@]} -eq 0 ]]; then
+    echo "ERROR: no UEFI firmware to attach to the VM. Run 'agent-sandbox build'." >&2
+    exit 1
+  fi
+  (
+    cd "$INSTANCE_HOME" &&
+    qemu-system-x86_64 \
+      -name "$VM_NAME" \
+      -accel "$SANDBOX_ACCEL" \
+      -cpu "$VM_CPU_MODEL" -smp $VM_THREADS -m $VM_MEMORY_RAM \
+      -display "none" -monitor "none" -serial "file:$QEMU_LOG" \
+      -daemonize -pidfile "$QEMU_PIDFILE" \
+      \
+      "${pflash[@]}" \
+      \
+      -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
+      \
+      -device "virtio-net-pci,netdev=host" \
+      -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_VM_PORT-:$OPENCODE_VM_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:$HOST_PROXY_PORT-cmd:socat - TCP:127.0.0.1:$HOST_PROXY_PORT" \
+      \
+      -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
+      -numa "node,memdev=mem" \
+      \
+      -chardev "socket,id=fs0,path=$FS_SOCK" \
+      -device "vhost-user-fs-pci,chardev=fs0,tag=workdir"
+  ) || rc=$?
+
+  if [[ $rc -ne 0 ]]; then
+    echo "ERROR: QEMU failed to start (exit $rc). Console log: $QEMU_LOG" >&2
+    exit 1
+  fi
 }
 
 wait_for_ssh() {
@@ -1068,19 +1720,31 @@ wait_for_ssh() {
 }
 
 mount_workdir() {
-    local mount_opts=""
+    local mount_opts="" remount_opts=""
     if [[ "$VM_WORKDIR_RO" == "on" ]]; then
       mount_opts="-o ro"
+      remount_opts="remount,ro"
       echo 'Binding current directory with VM (read-only)'
     else
+      remount_opts="remount,rw"
       echo 'Binding current directory with VM'
     fi
 
-    _ssh root "
+    # The golden image carries an fstab entry, so a guest that has been rebooted
+    # is already mounting the share. Remounting keeps the mount options honest
+    # (--workdir-ro has to show up as 'ro' inside the guest, not only in
+    # virtiofsd's --readonly) instead of stacking a second virtiofs mount on the
+    # same path, which would hide the first one. A failure here is fatal: an
+    # agent that cannot see the directory it was started in is worse than none.
+    if ! _ssh root "
       mkdir -p $VM_AGENT_WORKDIR \
-      && modprobe virtiofs 2>/dev/null || true \
-      && mount $mount_opts -t virtiofs workdir $VM_AGENT_WORKDIR
-    "
+      ; modprobe virtiofs 2>/dev/null || true \
+      ; if mountpoint -q $VM_AGENT_WORKDIR; then mount -o $remount_opts -t virtiofs workdir $VM_AGENT_WORKDIR; else mount $mount_opts -t virtiofs workdir $VM_AGENT_WORKDIR; fi
+    "; then
+      echo "ERROR: could not mount the shared directory inside the VM." >&2
+      echo "       Check virtiofsd: $VIRTIOFSD_LOG" >&2
+      exit 1
+    fi
 }
 
 configure_vm_env() {
@@ -1096,162 +1760,189 @@ configure_vm_env() {
     "
 }
 
-run_agent(){
-  local agent=$1
-  local model=$2
-  local context_size=$3
+# Emits the OpenCode V2 config: a single custom OpenAI-compatible provider that
+# points at the host LLM proxy, reachable inside the VM as 10.0.2.100:11434.
+opencode_config_json(){
+  local model=$1
+  local context_size=$2
+  {
+    printf '%s\n' '{'
+    printf '%s\n' '  "$schema": "https://opencode.ai/config.json",'
+    printf '%s\n' '  "model": "local/'"$model"'",'
+    printf '%s\n' '  "providers": {'
+    printf '%s\n' '    "local": {'
+    printf '%s\n' '      "name": "Local",'
+    printf '%s\n' '      "package": "@opencode/ai/providers/openai-compatible",'
+    printf '%s\n' '      "settings": {'
+    printf '%s\n' '        "baseURL": "http://10.0.2.100:11434/v1",'
+    printf '%s\n' '        "apiKey": "local"'
+    printf '%s\n' '      },'
+    printf '%s\n' '      "models": {'
+    printf '%s\n' '        "'"$model"'": {'
+    printf '%s\n' '          "name": "'"$model"'",'
+    printf '%s\n' '          "capabilities": {'
+    printf '%s\n' '            "tools": true,'
+    printf '%s\n' '            "input": ["text", "image"],'
+    printf '%s\n' '            "output": ["text"]'
+    printf '%s\n' '          },'
+    printf '%s\n' '          "limit": {'
+    printf '%s\n' '            "context": '"$context_size"','
+    printf '%s\n' '            "output": '"$((context_size / 2))"
+    printf '%s\n' '          }'
+    printf '%s\n' '        }'
+    printf '%s\n' '      }'
+    printf '%s\n' '    }'
+    printf '%s\n' '  },'
+    printf '%s\n' '  "permissions": ['
+    printf '%s\n' '    { "action": "*", "resource": "*", "effect": "allow" }'
+    printf '%s\n' '  ]'
+    printf '%s\n' '}'
+  }
+}
 
-  local continue_session=""
-  [[ -f "$AGENT_ALIVE" ]] && continue_session="--continue"
+# systemd unit for the OpenCode server. Runs as the agent user; the credential
+# file is root-owned so it is only readable by systemd (before setuid).
+opencode_unit_text(){
+  {
+    printf '%s\n' '[Unit]'
+    printf '%s\n' 'Description=OpenCode V2 server (agent-sandbox)'
+    printf '%s\n' 'After=network-online.target docker.service'
+    printf '%s\n' 'Wants=docker.service'
+    printf '%s\n' ''
+    printf '%s\n' '[Service]'
+    printf '%s\n' 'Type=simple'
+    printf '%s\n' 'User='"$VM_AGENT_USER"
+    printf '%s\n' 'Group='"$VM_AGENT_USER"
+    printf '%s\n' 'WorkingDirectory='"$VM_AGENT_WORKDIR"
+    printf '%s\n' 'Environment=HOME=/home/'"$VM_AGENT_USER"
+    printf '%s\n' 'EnvironmentFile=/etc/opencode/server.env'
+    printf '%s\n' 'ExecStart=/usr/local/bin/opencode serve --hostname 0.0.0.0 --port '"$OPENCODE_VM_PORT"
+    printf '%s\n' 'Restart=always'
+    printf '%s\n' 'RestartSec=2'
+    printf '%s\n' 'StandardOutput=append:/home/'"$VM_AGENT_USER"'/.local/state/opencode/opencode.log'
+    printf '%s\n' 'StandardError=append:/home/'"$VM_AGENT_USER"'/.local/state/opencode/opencode.err'
+    printf '%s\n' '# Hardening knobs. Drop ProtectSystem if a session needs to write outside'
+    printf '%s\n' '# HOME and the workdir (for example apt-get or npm install -g).'
+    printf '%s\n' 'ProtectSystem=full'
+    printf '%s\n' 'ProtectKernelTunables=yes'
+    printf '%s\n' 'ProtectKernelLogs=yes'
+    printf '%s\n' 'PrivateTmp=yes'
+    printf '%s\n' 'LimitNOFILE=65536'
+    printf '%s\n' ''
+    printf '%s\n' '[Install]'
+    printf '%s\n' 'WantedBy=multi-user.target'
+  }
+}
 
-  if [[ $agent == "opencode" ]]; then
-    local opencode_bind_ip="${OPENCODE_BIND_IP:-}"
-    if [[ -z "$opencode_bind_ip" ]] && have_cmd ip; then
-      opencode_bind_ip="$(ip route get "$LOCAL_LLM_HOST" 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
-    fi
-    [[ -z "$opencode_bind_ip" ]] && opencode_bind_ip="0.0.0.0"
+start_opencode(){
+  local model=$1
+  local context_size=$2
 
-    echo
-    echo "Starting OpenCode as an OpenRC service..."
+  local opencode_bind_ip
+  opencode_bind_ip="$(opencode_bind_address)"
 
-    # OpenCode itself is a foreground process. Let OpenRC own it so the SSH
-    # session can exit immediately while the VM and OpenCode stay alive.
-    #
-    # _ssh() intentionally removes newlines from remote commands, so do not
-    # use heredocs here. Encode the small service/wrapper files instead.
-    local opencode_config_b64
-    local opencode_wrapper_b64
-    local opencode_service_b64
+  # OpenCode V2 serves its web UI from the same origin and protects it with
+  # Basic auth (username is always "opencode"). Reuse the previous password so
+  # restarting an instance does not invalidate paired browser sessions.
+  local server_password=""
+  if [[ -f "$OPENCODE_ENV" ]]; then
+    server_password="$(sed -n 's/^OPENCODE_PASSWORD=//p' "$OPENCODE_ENV" | head -n1 || true)"
+  fi
+  [[ -z "$server_password" ]] && server_password="$(random_password)"
+  (
+    umask 077
+    {
+      printf 'OPENCODE_PASSWORD=%s\n' "$server_password"
+      printf 'URL_LOCAL=http://127.0.0.1:%s\n' "$OPENCODE_WEB_PORT"
+    } > "$OPENCODE_ENV"
+  )
 
-    opencode_config_b64="$({
-      printf '%s\n' '{'
-      printf '%s\n' '  "$schema": "https://opencode.ai/config.json",'
-      printf '%s\n' '  "permission": "allow",'
-      printf '%s\n' '  "model": "local/'"$model"'",'
-      printf '%s\n' '  "provider": {'
-      printf '%s\n' '    "local": {'
-      printf '%s\n' '      "npm": "@ai-sdk/openai-compatible",'
-      printf '%s\n' '      "name": "Local",'
-      printf '%s\n' '      "options": {'
-      printf '%s\n' '        "baseURL": "http://10.0.2.100:11434/v1"'
-      printf '%s\n' '      },'
-      printf '%s\n' '      "models": {'
-      printf '%s\n' '        "'"$model"'": {'
-      printf '%s\n' '          "name": "'"$model"'",'
-      printf '%s\n' '          "limit": {'
-      printf '%s\n' '            "context": '"$context_size"','
-      printf '%s\n' '            "output": '"$((context_size / 2))"
-      printf '%s\n' '          },'
-      printf '%s\n' '          "modalities": {'
-      printf '%s\n' '            "input": ["text", "audio", "image", "video", "pdf"],'
-      printf '%s\n' '            "output": ["text", "audio", "image", "video", "pdf"]'
-      printf '%s\n' '          }'
-      printf '%s\n' '        }'
-      printf '%s\n' '      }'
-      printf '%s\n' '    }'
-      printf '%s\n' '  }'
-      printf '%s\n' '}'
-    } | base64 -w0)"
+  echo
+  echo "Starting OpenCode V2 as a systemd service..."
 
-    opencode_wrapper_b64="$({
-      printf '%s\n' '#!/bin/sh'
-      printf '%s\n' 'export HOME=/home/'"$VM_AGENT_USER"
-      printf '%s\n' 'export USER='"$VM_AGENT_USER"
-      printf '%s\n' 'export LOGNAME='"$VM_AGENT_USER"
-      printf '%s\n' 'cd /home/'"$VM_AGENT_USER"'/workdir'
-      printf '%s\n' 'exec opencode serve --port '"$OPENCODE_VM_PORT"' --hostname 0.0.0.0'
-    } | base64 -w0)"
+  # _ssh() intentionally removes newlines from remote commands, so do not
+  # use heredocs here. Encode the small config/service files instead.
+  local opencode_config_b64
+  local opencode_env_b64
+  local opencode_unit_b64
 
-    opencode_service_b64="$({
-      printf '%s\n' '#!/sbin/openrc-run'
-      printf '%s\n' 'name="opencode"'
-      printf '%s\n' 'description="OpenCode web server"'
-      printf '%s\n' 'command="/usr/local/bin/opencode-serve"'
-      printf '%s\n' 'command_user="'"$VM_AGENT_USER"'"'
-      printf '%s\n' 'command_background="yes"'
-      printf '%s\n' 'pidfile="/run/opencode.pid"'
-      printf '%s\n' 'output_log="/home/'"$VM_AGENT_USER"'/.local/state/opencode/opencode.log"'
-      printf '%s\n' 'error_log="/home/'"$VM_AGENT_USER"'/.local/state/opencode/opencode.err"'
-    } | base64 -w0)"
+  # OpenCode V2 config: one custom OpenAI-compatible provider pointing at the
+  # host LLM proxy exposed inside the VM as 10.0.2.100:11434.
+  opencode_config_b64="$(opencode_config_json "$model" "$context_size" | base64 -w0)"
 
-    _ssh root "
-      mkdir -p /home/$VM_AGENT_USER/.config/opencode
-      && printf '%s' '$opencode_config_b64' | base64 -d > /home/$VM_AGENT_USER/.config/opencode/opencode.json
-      && printf '%s' '$opencode_wrapper_b64' | base64 -d > /usr/local/bin/opencode-serve
-      && chmod +x /usr/local/bin/opencode-serve
-      && printf '%s' '$opencode_service_b64' | base64 -d > /etc/init.d/opencode
-      && chmod +x /etc/init.d/opencode
-      && chown -R $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.config/opencode
-      && { rc-update add opencode default >/dev/null 2>&1 || :; }
-      && rc-service opencode restart
-      && sleep 2
-      && rc-service opencode status
-    "
+  # Root-owned env file: systemd reads it before dropping privileges, so the
+  # agent user cannot read the server password out of /proc/1/environ style paths.
+  opencode_env_b64="$({
+    printf '%s\n' 'OPENCODE_PASSWORD='"$server_password"
+    printf '%s\n' 'OPENCODE_DISABLE_FREE_MODELS=1'
+  } | base64 -w0)"
 
-    # Mark the agent as started only after OpenCode has been handed off to OpenRC.
-    touch "$AGENT_ALIVE"
+  opencode_unit_b64="$(opencode_unit_text | base64 -w0)"
 
-    echo
-    echo "============================================================"
-    echo "OpenCode server is running in the background."
-    echo "  Local:  http://127.0.0.1:$OPENCODE_WEB_PORT"
-    if [[ "$opencode_bind_ip" != "0.0.0.0" ]]; then
-      echo "  LAN:    http://$opencode_bind_ip:$OPENCODE_WEB_PORT"
-    else
-      echo "  LAN:    http://<host-LAN-IP>:$OPENCODE_WEB_PORT"
-    fi
-    echo
-    echo "  Service: agent-sandbox ssh root 'rc-service opencode status'"
-    echo "============================================================"
-    echo
-
-
-  elif [[ $agent == "claude" ]]; then
-    _ssh $VM_AGENT_USER "
-      export ANTHROPIC_BASE_URL='http://10.0.2.100:11434'
-      && export ANTHROPIC_AUTH_TOKEN='local'
-      && export ANTHROPIC_API_KEY=''
-      && claude --allow-dangerously-skip-permissions --model $model $continue_session
-    "
-  elif [[ $agent == "qwen" ]]; then
-    _ssh $VM_AGENT_USER "
-      mkdir -p ~/.qwen
-      && printf '%s' '{
-        \"\$version\": 3,
-        \"modelProviders\": {
-          \"openai\": [
-            {
-              \"id\": \"$model\",
-              \"name\": \"$model\",
-              \"baseUrl\": \"http://10.0.2.100:11434/v1\",
-              \"envKey\": \"QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_0_2_100_11434_V1\"
-            }
-          ]
-        },
-        \"security\": {
-          \"auth\": {
-            \"selectedType\": \"openai\"
-          }
-        },
-        \"model\": {
-          \"name\": \"$model\"
-        },
-        \"permissions\": {
-          \"defaultMode\": \"yolo\",
-          \"confirmShellCommands\": false,
-          \"confirmFileEdits\": false
-        },
-        \"env\": {
-          \"QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_0_2_100_11434_V1\": \"local\"
-        }
-      }' > ~/.qwen/settings.json
-      && qwen $continue_session
-    "
-  elif [[ $agent == "ssh" ]]; then
-    _ssh $VM_AGENT_USER 'bash'
+  # 'install -d' leaves the intermediate directories root-owned, and OpenCode
+  # needs to create ~/.local/share itself, so chown every component explicitly.
+  if ! _ssh root "
+    mkdir -p /home/$VM_AGENT_USER/.config/opencode /home/$VM_AGENT_USER/.local/state/opencode /home/$VM_AGENT_USER/.local/share/opencode
+    && chown $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.config /home/$VM_AGENT_USER/.local /home/$VM_AGENT_USER/.config/opencode /home/$VM_AGENT_USER/.local/state /home/$VM_AGENT_USER/.local/share /home/$VM_AGENT_USER/.local/state/opencode /home/$VM_AGENT_USER/.local/share/opencode
+    && printf '%s' '$opencode_config_b64' | base64 -d > /home/$VM_AGENT_USER/.config/opencode/opencode.json
+    && chown $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.config/opencode/opencode.json
+    && install -d -m 0755 /etc/opencode
+    && printf '%s' '$opencode_env_b64' | base64 -d > /etc/opencode/server.env
+    && chmod 0600 /etc/opencode/server.env
+    && printf '%s' '$opencode_unit_b64' | base64 -d > /etc/systemd/system/opencode.service
+    && chmod 0644 /etc/systemd/system/opencode.service
+    && systemctl daemon-reload
+    && systemctl enable opencode
+    && systemctl restart opencode
+  "
+  then
+    echo "ERROR: could not install the OpenCode service in the VM." >&2
+    exit 1
   fi
 
-  touch "$AGENT_ALIVE"
+  wait_for_opencode "$server_password"
+
+  echo
+  echo "============================================================"
+  echo "OpenCode V2 is running inside the VM as a systemd service."
+  echo "  Local:   http://127.0.0.1:$OPENCODE_WEB_PORT"
+  case "$opencode_bind_ip" in
+    0.0.0.0) echo "  LAN:     http://<host-LAN-IP>:$OPENCODE_WEB_PORT   (published on all interfaces)" ;;
+    127.*)   echo "  LAN:     not published, HAProxy binds loopback. Use --local-llm-host <LAN IP>"
+             echo "           or OPENCODE_BIND_IP=0.0.0.0 to expose it on the LAN." ;;
+    *)       echo "  LAN:     http://$opencode_bind_ip:$OPENCODE_WEB_PORT" ;;
+  esac
+  echo
+  echo "  Sign in: user opencode / password $server_password"
+  echo "  Saved:   $OPENCODE_ENV"
+  echo
+  echo "  Status:  agent-sandbox ssh root 'systemctl status opencode'"
+  echo "  Logs:    agent-sandbox ssh root 'tail -n 50 /home/$VM_AGENT_USER/.local/state/opencode/opencode.log'"
+  echo "============================================================"
+  echo
+}
+
+# /api/info answers 200 only with the right Basic auth (401 otherwise), which
+# makes it both a readiness probe and a credential check.
+wait_for_opencode(){
+  local password=$1
+  local tries=24 info="" code=000
+
+  echo "Waiting for OpenCode on port $OPENCODE_WEB_PORT..."
+  while [[ "$tries" -gt 0 ]]; do
+    info="$(curl -s -m 3 -u "opencode:$password" "http://127.0.0.1:$OPENCODE_WEB_PORT/api/info" 2>/dev/null || true)"
+    code="$(printf '%s' "$info" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1 || true)"
+    [[ -n "$code" ]] && break
+    sleep 2.5
+    tries=$((tries - 1))
+  done
+
+  if [[ -z "$code" ]]; then
+    echo "ERROR: OpenCode did not answer on port $OPENCODE_WEB_PORT." >&2
+    _ssh root "systemctl status opencode --no-pager; tail -n 40 /home/$VM_AGENT_USER/.local/state/opencode/opencode.log /home/$VM_AGENT_USER/.local/state/opencode/opencode.err" || true
+    exit 1
+  fi
+  echo "OpenCode $code is answering on :$OPENCODE_WEB_PORT"
 }
 
 #--------------------------------------------------------------------------------
@@ -1259,10 +1950,9 @@ run_agent(){
 #--------------------------------------------------------------------------------
 
 _run(){
-  local agent="${1:-$CMD_DEFAULT_RUN_AGENT}"
-  local model="${2:-$CMD_DEFAULT_RUN_LOCAL_MODEL}"
-  local context_size="${3:-124000}"
-  local dns_whitelist_csv="${4:-}"
+  local model="${1:-$CMD_DEFAULT_MODEL}"
+  local context_size="${2:-$CMD_DEFAULT_CONTEXT_SIZE}"
+  local dns_whitelist_csv="${3:-}"
 
   if is_running qemu; then
     echo "============================================================"
@@ -1278,11 +1968,23 @@ _run(){
     exit 1
   fi
 
+  if [[ -f "$IMAGE_STAMP" ]] && ! grep -q "^base_image=$DOWNLOAD_IMAGE$" "$IMAGE_STAMP"; then
+    echo "WARNING: the golden image was built from a different base image:"
+    sed -n 's/^/  /p' "$IMAGE_STAMP"
+    echo "         Re-run 'agent-sandbox build' to pick up the current one."
+    echo
+  fi
+
   ensure_prereqs
   create_session_overlay
 
   if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -n "$dns_whitelist_csv" ]]; then
     install_whitelist "$dns_whitelist_csv"
+  elif [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$WHITELIST_FILE" ]]; then
+    # Fail-safe: a whitelist left by an earlier run of this directory keeps the
+    # VM locked down. 'purge' forgets it, --dns-whitelist replaces it.
+    echo "  Reusing the whitelist from an earlier run ($(wc -l < "$WHITELIST_FILE") domain(s))."
+    echo "  Pass --dns-whitelist to replace it, or 'agent-sandbox purge' to drop it."
   fi
 
   start_virtiofsd
@@ -1300,9 +2002,16 @@ _run(){
 
   if [[ "$VM_RESTRICT_NETWORK" == "on" ]] && [[ -f "$WHITELIST_FILE" ]]; then
     setup_vm_firewall
+  else
+    teardown_vm_firewall
+    if [[ "$VM_RESTRICT_NETWORK" == "on" ]]; then
+      echo "  No DNS whitelist: the VM can reach only the LLM proxy, the registry and"
+      echo "  the shared workdir. Outbound name resolution needs --dns-whitelist,"
+      echo "  because QEMU's user-mode resolver cannot reach a stub resolver on the host."
+    fi
   fi
 
-  run_agent "$agent" "$model" "$context_size"
+  start_opencode "$model" "$context_size"
 }
 
 #--------------------------------------------------------------------------------
@@ -1406,30 +2115,26 @@ _sync(){
 get_pids() {
   local instance_dir="$1"
   local pid_list=""
-  for pidfile in "$instance_dir"/*.pid; do
-    if [[ -f "$pidfile" ]]; then
-      local pname="$(basename "$pidfile" .pid)"
-      local pid="$(cat "$pidfile" 2>/dev/null || echo stopped)"
-      [[ -n "$pid_list" ]] && pid_list="$pid_list, "
-      pid_list="${pid_list}${pname}:${pid}"
-    fi
-  done
+  local pidfile
+  while IFS= read -r pidfile; do
+    local pname="$(basename "$pidfile" .pid)"
+    local pid="$(cat "$pidfile" 2>/dev/null || echo stopped)"
+    [[ -n "$pid_list" ]] && pid_list="$pid_list, "
+    pid_list="${pid_list}${pname}:${pid}"
+  done < <(instance_pidfiles "$instance_dir")
   echo "$pid_list"
 }
 
 is_session_active() {
   local instance_dir="$1"
-  local has_active=0
-  for pidfile in "$instance_dir"/*.pid; do
-    if [[ -f "$pidfile" ]]; then
-      local pid="$(cat "$pidfile" 2>/dev/null)"
-      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        has_active=1
-        break
-      fi
+  local pidfile pid
+  while IFS= read -r pidfile; do
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
     fi
-  done
-  return $((1 - has_active))
+  done < <(instance_pidfiles "$instance_dir")
+  return 1
 }
 
 _status(){
@@ -1509,16 +2214,15 @@ stop_daemons() {
   fi
 
   # Kill all remaining daemons via pidfiles
-  find "$INSTANCE_HOME" -name '*.pid' | while read pidfile; do
-    local pname
+  local pidfile pname
+  while IFS= read -r pidfile; do
     pname="$(basename "$pidfile" .pid)"
     echo "Stopping $pname..."
     kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
     rm -f "$pidfile"
     sleep 1
-  done
+  done < <(instance_pidfiles "$INSTANCE_HOME")
 
-  rm -f "$AGENT_ALIVE"
   rm -f "$FS_SOCK"
 }
 
