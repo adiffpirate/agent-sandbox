@@ -917,6 +917,12 @@ start_virtiofsd() {
   done
 }
 
+# Non-loopback IPv4 addresses of this host, used only to print connect URLs.
+host_ipv4_addresses() {
+  have_cmd ip || return 0
+  ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | head -3
+}
+
 start_haproxy(){
   if is_running haproxy; then
     echo "haproxy already running, skipping"
@@ -1883,14 +1889,39 @@ start_opencode(){
 
   wait_for_opencode "$server_password"
 
+  local -a lan_addrs=()
+  mapfile -t lan_addrs < <(host_ipv4_addresses)
+
   echo
   echo "============================================================"
   echo "OpenCode V2 is running inside the VM as a systemd service."
-  echo "  Local:   http://127.0.0.1:$OPENCODE_WEB_PORT"
-  echo "  LAN:     http://<host-ip>:$OPENCODE_WEB_PORT (published on all interfaces)"
+  echo "  Password: $server_password"
+  echo "  Saved to: $OPENCODE_ENV"
   echo
-  echo "  Sign in: user opencode / password $server_password"
-  echo "  Saved:   $OPENCODE_ENV"
+  echo "  Connect to the agent (HAProxy publishes the port on 0.0.0.0, Basic auth protects it):"
+  echo
+  echo "    Browser     http://127.0.0.1:$OPENCODE_WEB_PORT"
+  if [[ ${#lan_addrs[@]} -gt 0 ]]; then
+    for ip in "${lan_addrs[@]}"; do
+      printf '                http://%s:%s\n' "$ip" "$OPENCODE_WEB_PORT"
+    done
+    echo "                (the same UI, from any other machine on this network)"
+  else
+    echo "                http://<this host's address>:$OPENCODE_WEB_PORT  (the same UI, from another machine)"
+  fi
+  echo "              pick 'Use password', then server address = the URL you opened,"
+  echo "              password = the one above. There is no user name in that form."
+  echo
+  echo "    HTTP API    curl -u opencode:$server_password http://127.0.0.1:$OPENCODE_WEB_PORT/api/session"
+  echo "              POST /api/session, POST /api/session/<id>/prompt {\"text\":\"...\"},"
+  echo "              GET /api/session/<id>/message; GET /openapi.json documents everything."
+  echo
+  echo "    OpenCode CLI, in the VM (as $VM_AGENT_USER, in the shared workdir):"
+  echo "              OPENCODE_PASSWORD=$server_password opencode --server http://127.0.0.1:$OPENCODE_VM_PORT run 'your prompt'"
+  echo "              Reached with: agent-sandbox ssh $VM_AGENT_USER \"cd $VM_AGENT_WORKDIR && ...\""
+  echo "              A CLI on another machine can call 'opencode --server http://127.0.0.1:$OPENCODE_WEB_PORT api ...'"
+  echo "              but cannot start a session: the session directory has to exist inside the VM,"
+  echo "              so use the browser for a remote UI."
   echo
   echo "  Status:  agent-sandbox ssh root 'systemctl status opencode'"
   echo "  Logs:    agent-sandbox ssh root 'tail -n 50 /home/$VM_AGENT_USER/.local/state/opencode/opencode.log'"

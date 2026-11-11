@@ -135,18 +135,24 @@ agent-sandbox run [--model <model>] [--context-size <size>] [--vm-memory <size>]
 ```
 
 Starts the VM, mounts the current directory, and starts `opencode.service` in the guest.
-The run prints the URL and the Basic-auth password (also saved to
-`~/.local/share/agent-sandbox/instances/<id>/opencode.env`).
+`run` ends with the URLs to connect to, the generated password, and copy-pasteable commands
+(the password is also saved to `~/.local/share/agent-sandbox/instances/<id>/opencode.env`,
+mode `0600`).
 
 **Note**: `agent-sandbox build` must be run before `run`.
 
-The OpenCode server is protected with Basic auth (username `opencode`, generated
-password), so the printed link works from any browser on the host or the LAN.
+### Connect to OpenCode
 
-### Drive the agent over HTTP
+HAProxy publishes the agent's port on `0.0.0.0` and OpenCode guards it with Basic auth
+(username `opencode`, generated password), so all of the routes below work from the host and
+from any other machine on the network. Replace `9805` with the port `run` prints.
 
-Inside the guest, OpenCode answers its usual V2 HTTP API and HAProxy publishes
-that port on the host, so a session can be driven from a script:
+**In a browser** — open `http://127.0.0.1:9805`, or `http://<host address>:9805` from another
+machine (that is also the way to reach it from a phone or a laptop). The app offers a pairing
+link or a password: pick **Use password**, set "Server address" to the URL you opened, and
+"Password" to the printed one — there is no user name in that form.
+
+**Over the HTTP API** — OpenCode answers its usual V2 API inside the guest:
 
 ```bash
 INST=$(agent-sandbox status | awk 'NR==2{print $1}')
@@ -161,6 +167,18 @@ curl -s -u "$AUTH" -H "$JSON" -X POST -d '{"text":"fix the build"}' \
            "$API/api/session/$SESSION/prompt" > /dev/null
 curl -s -u "$AUTH" "$API/api/session/$SESSION/message"          # assistant replies
 ```
+
+**With the OpenCode CLI inside the VM** (`--server` points the CLI at the running
+`opencode.service` on port `19805` instead of starting its own):
+
+```bash
+agent-sandbox ssh agent \
+  "cd /home/agent/workdir && OPENCODE_PASSWORD=$PW opencode --server http://127.0.0.1:19805 run 'fix the build'"
+```
+
+A CLI on **another** machine can call `OPENCODE_PASSWORD=$PW opencode --server http://<host address>:9805 api <operation>`,
+but it cannot open a session there: a session is bound to a directory that has to exist inside
+the VM, so the browser is the remote UI.
 
 Each session works in `/home/agent/workdir` inside the VM, which is the directory
 you ran `agent-sandbox run` from: a tool call that writes a file produces that
