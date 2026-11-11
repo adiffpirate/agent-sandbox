@@ -135,29 +135,57 @@ agent-sandbox run [--model <model>] [--context-size <size>] [--vm-memory <size>]
 ```
 
 Starts the VM, mounts the current directory, and starts `opencode.service` in the guest.
-`run` ends with the URLs to connect to, the generated password, and copy-pasteable commands
-(the password is also saved to `~/.local/share/agent-sandbox/instances/<id>/opencode.env`,
-mode `0600`).
+`run` ends with the address to connect to and copy-pasteable commands; it never prints the
+password, because that lives in the settings file described below.
 
 **Note**: `agent-sandbox build` must be run before `run`.
+
+### Settings: `.env`
+
+The first `run` writes a `.env` file in the directory you run it from (mode `0600`) and every
+later `run` reads it, so that file — not a flag — is where the two secrets live:
+
+```bash
+# API key sent to the LLM at --local-llm-host. Leave empty for an LLM that needs no key.
+LLM_API_KEY=
+
+# Password for the OpenCode UI and API (Basic auth user 'opencode').
+OPENCODE_PASSWORD=<generated on the first run>
+```
+
+- **`LLM_API_KEY`** is written into the in-VM OpenCode config as
+  `providers.local.settings.apiKey`, which is the key the agent sends to `--local-llm-host`.
+  An empty value keeps the placeholder `local` that keyless servers use. Only
+  letters, digits and `. _ : + / = -` are accepted, because the value ends up in JSON.
+- **`OPENCODE_PASSWORD`** signs the browser UI, the HTTP API and the OpenCode CLI. A blank
+  value means "generate a new one", never "run without a password".
+
+**Edit the file, then rerun `agent-sandbox run`** — a rerun with a new password restarts
+`opencode.service` with it, so the new password works and the old one stops working. `run`
+prints `Settings: <path>` and stops if the file cannot be read or written. Two things to know:
+the file sits in the shared workdir, so inside the VM it is readable as
+`/home/agent/workdir/.env` (share only directories you trust), and if the workdir is a git
+working tree `run` warns until `.env` is in `.gitignore`. With `--workdir-ro` the file has to
+exist before the run. Older releases kept the generated password in
+`~/.local/share/agent-sandbox/instances/<id>/opencode.env`; the first run moves it into `.env`
+and deletes that file.
 
 ### Connect to OpenCode
 
 HAProxy publishes the agent's port on `0.0.0.0` and OpenCode guards it with Basic auth
-(username `opencode`, generated password), so all of the routes below work from the host and
-from any other machine on the network. Replace `9805` with the port `run` prints.
+(username `opencode`, the password from `.env`), so all of the routes below work from the host
+and from any other machine on the network. Replace `9805` with the port `run` prints.
 
-**In a browser** — open `http://127.0.0.1:9805`, or `http://<host address>:9805` from another
-machine (that is also the way to reach it from a phone or a laptop). The app offers a pairing
-link or a password: pick **Use password**, set "Server address" to the URL you opened, and
-"Password" to the printed one — there is no user name in that form.
+**In a browser** — open `http://<host address>:9805`; the same address works on the host itself
+and on any other machine (that is how you reach it from a laptop or a phone). The app offers a
+pairing link or a password: pick **Use password**, set "Server address" to the URL you opened,
+and "Password" to `OPENCODE_PASSWORD` — there is no user name in that form.
 
 **Over the HTTP API** — OpenCode answers its usual V2 API inside the guest:
 
 ```bash
-INST=$(agent-sandbox status | awk 'NR==2{print $1}')
-PW=$(sed -n 's/^OPENCODE_PASSWORD=//p' ~/.local/share/agent-sandbox/instances/$INST/opencode.env)
-API=http://127.0.0.1:9805                      # the port 'run' prints
+PW=$(sed -n 's/^OPENCODE_PASSWORD=//p' .env)   # the file 'run' reads
+API=http://<host address>:9805                 # the address 'run' prints
 AUTH="opencode:$PW"
 JSON='content-type: application/json'
 
@@ -173,12 +201,14 @@ curl -s -u "$AUTH" "$API/api/session/$SESSION/message"          # assistant repl
 
 ```bash
 agent-sandbox ssh agent \
-  "cd /home/agent/workdir && OPENCODE_PASSWORD=$PW opencode --server http://127.0.0.1:19805 run 'fix the build'"
+  "cd /home/agent/workdir && OPENCODE_PASSWORD=$PW opencode --server http://10.0.2.15:19805 run 'fix the build'"
 ```
 
-A CLI on **another** machine can call `OPENCODE_PASSWORD=$PW opencode --server http://<host address>:9805 api <operation>`,
-but it cannot open a session there: a session is bound to a directory that has to exist inside
-the VM, so the browser is the remote UI.
+Inside the VM use the VM's own address (`run` prints it), because the published port is not
+reachable from the guest itself. A CLI on **another** machine can call
+`OPENCODE_PASSWORD=$PW opencode --server http://<host address>:9805 api <operation>`, but it
+cannot open a session there: a session is bound to a directory that has to exist inside the VM,
+so the browser is the remote UI.
 
 Each session works in `/home/agent/workdir` inside the VM, which is the directory
 you ran `agent-sandbox run` from: a tool call that writes a file produces that
@@ -250,7 +280,8 @@ What the golden image and a running instance enforce:
 
 - **Base image**: Ubuntu Minimal — no snapd (purged at build), no docs/man pages, no build toolchain, volatile journald capped at 64 MB. The agent account is pinned to uid 1001 / gid 1002 (`VM_AGENT_UID`/`VM_AGENT_GID`) and the build aborts if that did not happen.
 - **Accounts**: a default user inherited from the base image is locked with `nologin`; SSH accepts only `agent` and `root`, publickey only, `MaxAuthTries 3`, no password/keyboard-interactive auth, no TCP forwarding or tunnels. Root has a random password that exists for the serial console only.
-- **OpenCode**: runs as an unprivileged `systemd` service with `ProtectSystem=full`, `ProtectKernelTunables`, `ProtectKernelLogs`, `PrivateTmp`; its password lives in a root-owned `0600` env file that the agent user cannot read. Free upstream models are disabled (`OPENCODE_DISABLE_FREE_MODELS=1`).
+- **OpenCode**: runs as an unprivileged `systemd` service with `ProtectSystem=full`, `ProtectKernelTunables`, `ProtectKernelLogs`, `PrivateTmp`; inside the VM its password lives in a root-owned `0600` env file that the agent user cannot read. Free upstream models are disabled (`OPENCODE_DISABLE_FREE_MODELS=1`).
+- **Secrets**: `LLM_API_KEY` and `OPENCODE_PASSWORD` live in a `0600` `.env` file in the shared workdir and are never printed by `run`. Inside the VM they are as visible as anything you share: the agent reads `/home/agent/workdir/.env`, and `LLM_API_KEY` is also written into the agent's own `opencode.json`. Share only directories you trust, and keep `.env` out of git (`run` warns if it is not ignored).
 - **Outer network layer**: QEMU's user-mode NIC runs with `restrict=on`, so the guest cannot open any outbound connection that is not one of the explicit `hostfwd`/`guestfwd` channels (SSH, the OpenCode port, the LLM proxy, the registry, the whitelist proxy).
 - **Guest firewall** (when `--dns-whitelist` is set): applied by `/usr/local/bin/agent-sandbox-firewall.sh apply`, which **fails closed** — if the nftables ruleset does not load, `agent-sandbox run` stops instead of starting an agent with no policy. The ruleset sets `input` policy `drop` (accepting only loopback, established flows, DHCP renewals, Docker-bridge DNS and the two host-forwarded ports) and DNATs every outbound 80/443 to the host's domain-whitelist proxy. `systemd-resolved` is masked and `/etc/resolv.conf` is made immutable so nothing can reopen DNS; AAAA queries are answered with NODATA because only IPv4 is proxied. `dns-proxy` and the ruleset are systemd units, so the policy survives a VM reboot.
 - **Identity mapping**: virtiofsd maps the guest's pinned agent ids onto the host user (`--uid-map=:1001:<host uid>:1:`), which is what makes writes in `/home/agent/workdir` land on the host owned by you. If you change `VM_AGENT_UID`/`VM_AGENT_GID`, rebuild the golden image.

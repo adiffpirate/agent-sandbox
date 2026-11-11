@@ -1,0 +1,2 @@
+# agent-sandbox keeps LLM_API_KEY and OPENCODE_PASSWORD here (written by 'run').
+.env

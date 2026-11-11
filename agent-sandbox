@@ -121,8 +121,18 @@ REGISTRY_CONFIG="$INSTANCE_HOME/registry.conf"
 REGISTRY_PIDFILE="$INSTANCE_HOME/registry.pid"
 REGISTRY_LOG="$INSTANCE_HOME/registry.log"
 REGISTRY_DIR="$INSTANCE_HOME/registry"
-# Host-side copy of the OpenCode server credentials (0600), regenerated on every run.
-OPENCODE_ENV="$INSTANCE_HOME/opencode.env"
+# The settings file the user edits: LLM_API_KEY and OPENCODE_PASSWORD. It lives in
+# the directory 'run' was invoked from, which is also what the VM sees as
+# /home/agent/workdir, so it is read (and created) on every run: edit it, rerun.
+ENV_FILE="$WORKDIR/.env"
+# Where older releases kept the generated password; migrated into $ENV_FILE once.
+LEGACY_ENV_FILE="$INSTANCE_HOME/opencode.env"
+# Values read from $ENV_FILE on every run.
+LLM_API_KEY=""
+OPENCODE_PASSWORD=""
+# Non-loopback address OpenCode reports for itself inside the VM; used by the
+# connect instructions ('run' never prints the loopback address).
+OPENCODE_GUEST_URL=""
 # Records which base image + OpenCode version the golden image was built against.
 IMAGE_STAMP="$SANDBOX_HOME/vm-image.stamp"
 # Printed to the guest console by the last runcmd step; 'build' requires it.
@@ -1750,11 +1760,114 @@ configure_vm_env() {
     "
 }
 
+#--------------------------------------------------------------------------------
+# The .env file in the working directory: LLM_API_KEY and OPENCODE_PASSWORD.
+# Read on every run, so editing it and rerunning 'agent-sandbox run' is all it
+# takes to change either value.
+#--------------------------------------------------------------------------------
+
+# Last assignment of a key in $ENV_FILE; fails if the key is absent or empty.
+env_file_value(){
+  local key="$1" value=""
+  [[ -f "$ENV_FILE" ]] || return 1
+  value="$(awk -v k="$key" '
+      $0 ~ "^[[:space:]]*"k"[[:space:]]*=" { sub(/^[^=]*=/, "", $0); v = $0 }
+      END { sub(/[ \t\r]+$/, "", v); if (v != "") print v }' "$ENV_FILE")"
+  if [[ "$value" == '"'*'"' && ${#value} -ge 2 ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "$value" == "'"*"'" && ${#value} -ge 2 ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+# The key is written into JSON config and into a shell-safe guest file, so keep
+# its alphabet narrow rather than trying to quote whatever the user typed.
+validate_api_key(){
+  [[ -z "$LLM_API_KEY" ]] && return 0
+  if [[ ! "$LLM_API_KEY" =~ ^[A-Za-z0-9._:+/=-]+$ ]]; then
+    echo "ERROR: LLM_API_KEY in $ENV_FILE uses unsupported characters." >&2
+    echo "       Letters, digits and . _ : + / = - only (it is written into the" >&2
+    echo "       in-VM OpenCode config as JSON)." >&2
+    exit 1
+  fi
+}
+
+write_env_file(){
+  local why="$1"
+  if ! (
+    umask 077
+    cat > "$ENV_FILE" <<EOF
+# agent-sandbox settings - edit these two values, then rerun 'agent-sandbox run'.
+# Everything here is also visible inside the VM as /home/agent/workdir/.env.
+
+# API key sent to the LLM at --local-llm-host. Leave empty for an LLM that needs no key.
+LLM_API_KEY=$LLM_API_KEY
+
+# Password for the OpenCode UI and API (Basic auth user 'opencode').
+# Change it here and rerun 'agent-sandbox run' to apply it.
+OPENCODE_PASSWORD=$OPENCODE_PASSWORD
+EOF
+  ); then
+    echo "ERROR: could not write $ENV_FILE." >&2
+    echo "       Is this directory writable? ('agent-sandbox run' needs to keep these settings.)" >&2
+    exit 1
+  fi
+  chmod 0600 "$ENV_FILE" 2>/dev/null || true
+  echo "  Settings: $ENV_FILE ($why)"
+}
+
+# Reads $ENV_FILE, generating the password when it is missing or blank, and leaves
+# a complete file behind so the next run reuses it.
+load_env_file(){
+  LLM_API_KEY="$(env_file_value LLM_API_KEY || true)"
+  OPENCODE_PASSWORD="$(env_file_value OPENCODE_PASSWORD || true)"
+
+  # Older releases generated the password inside the instance directory.
+  if [[ -z "$OPENCODE_PASSWORD" ]] && [[ -f "$LEGACY_ENV_FILE" ]]; then
+    OPENCODE_PASSWORD="$(sed -n 's/^OPENCODE_PASSWORD=//p' "$LEGACY_ENV_FILE" | head -n1 || true)"
+    [[ -n "$OPENCODE_PASSWORD" ]] && echo "  Migrating the OpenCode password from $LEGACY_ENV_FILE"
+  fi
+
+  # A blank OPENCODE_PASSWORD means "generate one", never "run without a password".
+  if [[ -z "$OPENCODE_PASSWORD" ]]; then
+    OPENCODE_PASSWORD="$(random_password)"
+  fi
+  validate_api_key
+
+  if [[ ! -f "$ENV_FILE" ]] && [[ "$VM_WORKDIR_RO" == "on" ]]; then
+    echo "ERROR: --workdir-ro, and there is no $ENV_FILE to read the settings from." >&2
+    echo "       Run once without --workdir-ro (that creates it), or create it yourself:" >&2
+    printf '         LLM_API_KEY=<your key, or empty>\n' >&2
+    printf '         OPENCODE_PASSWORD=<your password>\n' >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    write_env_file created
+  else
+    write_env_file loaded
+  fi
+  [[ -f "$LEGACY_ENV_FILE" ]] && rm -f "$LEGACY_ENV_FILE"
+  return 0
+}
+
+# Warn when the settings file sits in a git working tree that would commit it.
+warn_if_env_not_ignored(){
+  have_cmd git || return 0
+  git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  git -C "$WORKDIR" check-ignore -q .env && return 0
+  echo "  Warning: $WORKDIR is a git working tree and .env is not ignored."
+  echo "           Add '.env' to .gitignore so the LLM key and password stay out of commits."
+}
+
 # Emits the OpenCode V2 config: a single custom OpenAI-compatible provider that
 # points at the host LLM proxy, reachable inside the VM as 10.0.2.100:11434.
 opencode_config_json(){
   local model=$1
   local context_size=$2
+  local api_key="${3:-local}"
   {
     printf '%s\n' '{'
     printf '%s\n' '  "$schema": "https://opencode.ai/config.json",'
@@ -1765,7 +1878,7 @@ opencode_config_json(){
     printf '%s\n' '      "package": "@opencode/ai/providers/openai-compatible",'
     printf '%s\n' '      "settings": {'
     printf '%s\n' '        "baseURL": "http://10.0.2.100:11434/v1",'
-    printf '%s\n' '        "apiKey": "local"'
+    printf '%s\n' '        "apiKey": "'"$api_key"'"'
     printf '%s\n' '      },'
     printf '%s\n' '      "models": {'
     printf '%s\n' '        "'"$model"'": {'
@@ -1828,22 +1941,9 @@ start_opencode(){
   local model=$1
   local context_size=$2
 
-  # OpenCode V2 serves its web UI from the same origin and protects it with
-  # Basic auth (username is always "opencode"). Reuse the previous password so
-  # restarting an instance does not invalidate paired browser sessions.
-  local server_password=""
-  if [[ -f "$OPENCODE_ENV" ]]; then
-    server_password="$(sed -n 's/^OPENCODE_PASSWORD=//p' "$OPENCODE_ENV" | head -n1 || true)"
-  fi
-  [[ -z "$server_password" ]] && server_password="$(random_password)"
-  (
-    umask 077
-    {
-      printf 'OPENCODE_PASSWORD=%s\n' "$server_password"
-      printf 'URL_LOCAL=http://127.0.0.1:%s\n' "$OPENCODE_WEB_PORT"
-    } > "$OPENCODE_ENV"
-  )
-
+  # load_env_file has already read (or generated) the password from $ENV_FILE,
+  # so an unchanged file keeps browser sessions working across restarts, and
+  # editing the file + rerunning replaces the password in the service too.
   echo
   echo "Starting OpenCode V2 as a systemd service..."
 
@@ -1854,13 +1954,15 @@ start_opencode(){
   local opencode_unit_b64
 
   # OpenCode V2 config: one custom OpenAI-compatible provider pointing at the
-  # host LLM proxy exposed inside the VM as 10.0.2.100:11434.
-  opencode_config_b64="$(opencode_config_json "$model" "$context_size" | base64 -w0)"
+  # host LLM proxy exposed inside the VM as 10.0.2.100:11434. LLM_API_KEY comes
+  # from $ENV_FILE; an empty key keeps the placeholder the LLMs here accept.
+  opencode_config_b64="$(opencode_config_json "$model" "$context_size" \
+    "${LLM_API_KEY:-local}" | base64 -w0)"
 
   # Root-owned env file: systemd reads it before dropping privileges, so the
   # agent user cannot read the server password out of /proc/1/environ style paths.
   opencode_env_b64="$({
-    printf '%s\n' 'OPENCODE_PASSWORD='"$server_password"
+    printf '%s\n' 'OPENCODE_PASSWORD='"$OPENCODE_PASSWORD"
     printf '%s\n' 'OPENCODE_DISABLE_FREE_MODELS=1'
   } | base64 -w0)"
 
@@ -1887,41 +1989,55 @@ start_opencode(){
     exit 1
   fi
 
-  wait_for_opencode "$server_password"
+  wait_for_opencode "$OPENCODE_PASSWORD"
 
   local -a lan_addrs=()
   mapfile -t lan_addrs < <(host_ipv4_addresses)
+  local lan_url="http://<this host's address>:$OPENCODE_WEB_PORT"
+  [[ ${#lan_addrs[@]} -gt 0 ]] && lan_url="http://${lan_addrs[0]}:$OPENCODE_WEB_PORT"
+  local guest_url="${OPENCODE_GUEST_URL:-http://vm.address:$OPENCODE_VM_PORT}"
 
   echo
   echo "============================================================"
   echo "OpenCode V2 is running inside the VM as a systemd service."
-  echo "  Password: $server_password"
-  echo "  Saved to: $OPENCODE_ENV"
   echo
-  echo "  Connect to the agent (HAProxy publishes the port on 0.0.0.0, Basic auth protects it):"
+  echo "  Settings: $ENV_FILE"
+  echo "    LLM_API_KEY        the key the agent sends to $LOCAL_LLM_HOST:$LOCAL_LLM_SERVER_PORT"
+  echo "    OPENCODE_PASSWORD  sign-in password for the UI and the API (Basic auth user 'opencode')"
+  echo "  Edit that file (mode 0600) and rerun 'agent-sandbox run' to change either one."
+  echo "  It is not printed here on purpose, and the file is world-readable inside the VM"
+  echo "  as $VM_AGENT_WORKDIR/.env, so keep the workdir shared only with directories you trust."
   echo
-  echo "    Browser     http://127.0.0.1:$OPENCODE_WEB_PORT"
+  echo "  Connect to the agent (published on 0.0.0.0, protected by Basic auth):"
+  echo
   if [[ ${#lan_addrs[@]} -gt 0 ]]; then
-    for ip in "${lan_addrs[@]}"; do
+    printf '    Browser     http://%s:%s\n' "${lan_addrs[0]}" "$OPENCODE_WEB_PORT"
+    for ip in "${lan_addrs[@]:1}"; do
       printf '                http://%s:%s\n' "$ip" "$OPENCODE_WEB_PORT"
     done
-    echo "                (the same UI, from any other machine on this network)"
   else
-    echo "                http://<this host's address>:$OPENCODE_WEB_PORT  (the same UI, from another machine)"
+    printf '    Browser     %s\n' "$lan_url"
   fi
-  echo "              pick 'Use password', then server address = the URL you opened,"
-  echo "              password = the one above. There is no user name in that form."
+  echo "              the same address works from this machine and from any other one"
+  echo "              on this network; pick 'Use password', then server address = the URL"
+  echo "              you opened and password = OPENCODE_PASSWORD from the settings file."
   echo
-  echo "    HTTP API    curl -u opencode:$server_password http://127.0.0.1:$OPENCODE_WEB_PORT/api/session"
-  echo "              POST /api/session, POST /api/session/<id>/prompt {\"text\":\"...\"},"
-  echo "              GET /api/session/<id>/message; GET /openapi.json documents everything."
+  echo "    HTTP API    PW=\$(sed -n 's/^OPENCODE_PASSWORD=//p' $ENV_FILE)"
+  echo "                curl -u \"opencode:\$PW\" $lan_url/api/session"
+  echo "                POST /api/session, POST /api/session/<id>/prompt {\"text\":\"...\"},"
+  echo "                GET /api/session/<id>/message; GET /openapi.json documents everything."
   echo
-  echo "    OpenCode CLI, in the VM (as $VM_AGENT_USER, in the shared workdir):"
-  echo "              OPENCODE_PASSWORD=$server_password opencode --server http://127.0.0.1:$OPENCODE_VM_PORT run 'your prompt'"
-  echo "              Reached with: agent-sandbox ssh $VM_AGENT_USER \"cd $VM_AGENT_WORKDIR && ...\""
-  echo "              A CLI on another machine can call 'opencode --server http://127.0.0.1:$OPENCODE_WEB_PORT api ...'"
-  echo "              but cannot start a session: the session directory has to exist inside the VM,"
-  echo "              so use the browser for a remote UI."
+  echo "    OpenCode CLI, inside the VM (as $VM_AGENT_USER, in the shared workdir):"
+  printf '                agent-sandbox ssh %s "cd %s && OPENCODE_PASSWORD=$PW \\\n' \
+    "$VM_AGENT_USER" "$VM_AGENT_WORKDIR"
+  printf '                  opencode --server %s run %syour prompt%s"\n' \
+    "$guest_url" "'" "'"
+  echo "                Inside the VM use the VM's own address ($guest_url): the published"
+  echo "                port is not reachable from the guest itself."
+  echo
+  echo "    A CLI on another machine can call 'opencode --server $lan_url api <operation>'"
+  echo "    but cannot start a session there: the session directory has to exist inside the"
+  echo "    VM, so the browser is the remote UI."
   echo
   echo "  Status:  agent-sandbox ssh root 'systemctl status opencode'"
   echo "  Logs:    agent-sandbox ssh root 'tail -n 50 /home/$VM_AGENT_USER/.local/state/opencode/opencode.log'"
@@ -1949,6 +2065,11 @@ wait_for_opencode(){
     _ssh root "systemctl status opencode --no-pager; tail -n 40 /home/$VM_AGENT_USER/.local/state/opencode/opencode.log /home/$VM_AGENT_USER/.local/state/opencode/opencode.err" || true
     exit 1
   fi
+  # /api/info also lists the addresses the server listens on inside the VM; the
+  # non-loopback one is what an in-guest CLI has to use.
+  OPENCODE_GUEST_URL="$(printf '%s' "$info" |
+    sed -n 's/.*"urls":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '"' |
+    grep -v '^http://127' | head -n1 || true)"
   echo "OpenCode $code is answering on :$OPENCODE_WEB_PORT"
 }
 
@@ -1960,6 +2081,11 @@ _run(){
   local model="${1:-$CMD_DEFAULT_MODEL}"
   local context_size="${2:-$CMD_DEFAULT_CONTEXT_SIZE}"
   local dns_whitelist_csv="${3:-}"
+
+  # Read/create the settings file first: a bad value must fail before a running
+  # instance is torn down, and the file has to exist before the workdir is shared.
+  load_env_file
+  warn_if_env_not_ignored
 
   if is_running qemu; then
     echo "============================================================"
@@ -2292,6 +2418,7 @@ _clean(){
   if [[ -d "$INSTANCE_HOME" ]]; then
     _stop
     clean_session_files
+    echo "  Left alone on purpose: $ENV_FILE (LLM_API_KEY, OPENCODE_PASSWORD)."
   fi
 }
 
@@ -2314,6 +2441,10 @@ _purge(){
     done
     INSTANCE_HOME="$SANDBOX_HOME/instances/$INSTANCE_ID"
     delete_sandbox_dir
+  fi
+  if [[ -f "$ENV_FILE" ]]; then
+    echo "  Left alone on purpose: $ENV_FILE (LLM_API_KEY, OPENCODE_PASSWORD)."
+    echo "  Delete that file too if this directory should forget those settings."
   fi
   sleep 3
 }
