@@ -2525,7 +2525,7 @@ start_hermes(){
     && chmod 0600 /etc/hermes/webui.env
     && mkdir -p /home/$VM_AGENT_USER/.local/state/hermes-webui
     && chown -R $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.local /home/$VM_AGENT_USER/.local/state /home/$VM_AGENT_USER/.local/state/hermes-webui
-    && printf '%s' '$config_patch_b64' | base64 -d | '$agent_python' - '$agent_dir/../.hermes/config.yaml'
+    && printf '%s' '$config_patch_b64' | base64 -d | '$agent_python' - '/home/$VM_AGENT_USER/.hermes/config.yaml'
     && chown $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.hermes/config.yaml
     && printf '%s' '$webui_unit_b64' | base64 -d > /etc/systemd/system/hermes-webui.service
     && chmod 0644 /etc/systemd/system/hermes-webui.service

@@ -72,6 +72,10 @@ grep -q 'disable_idle_agent' "$SCRATCH/_run.sh" || fail "_run does not disable t
 #     must stream straight into the interpreter.
 grep -q "base64 -d | '\$agent_python' - " "$SB" || fail "config patch is not piped through stdin (root /tmp exec)"
 grep -q "/tmp/hermes-config-patch.py" "$SB" && fail "root still executes a /tmp path"
+# ...and it must be handed the REAL config path (agent_dir is the checkout
+# inside ~/.hermes, so '$agent_dir/../.hermes/...' resolves to ~/.hermes/.hermes).
+grep -Fq "base64 -d | '\$agent_python' - '/home/\$VM_AGENT_USER/.hermes/config.yaml'" "$SB" || \
+  fail "config patch is not given the real config.yaml path"
 true
 
 # 4d. after the mutual disable, the starter must verify the other agent is down.
