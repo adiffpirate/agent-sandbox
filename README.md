@@ -139,20 +139,25 @@ image away and exits non-zero. Raise `BUILD_TIMEOUT` (seconds, default 2400) on 
 ### Run the agent
 
 ```bash
-agent-sandbox run [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro]
+agent-sandbox run [--agent <opencode|hermes>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro]
 ```
 
-Starts the VM, mounts the current directory, and starts `opencode.service` in the guest.
+Starts the VM, mounts the current directory, and starts one agent as a `systemd` service in the
+guest: `opencode.service` (default) or `hermes-webui.service` (`--agent hermes`). The other
+agent's unit is stopped and disabled, so switching agents on a running instance is just a rerun
+with a different `--agent`.
 `run` ends with the address to connect to and copy-pasteable commands; it never prints the
 password, because that lives in the settings file described below.
 
-**Note**: `agent-sandbox build` must be run before `run`.
+**Note**: `agent-sandbox build` must be run before `run`. `--agent hermes` additionally
+requires a golden image built with Hermes (the image stamp must carry a `hermes=` line);
+older images say so and ask for a rebuild.
 
 ### Settings: `.env`
 
 `run` writes a `.env` file for the instance in its own directory under
 `~/.local/share/agent-sandbox/instances/<id>/.env` (mode `0600`) and reads it on every run, so
-that file — not a flag — is where the two secrets live:
+that file — not a flag — is where the secrets live:
 
 ```bash
 # API key sent to the LLM at --local-llm-host. Leave empty for an LLM that needs no key.
@@ -160,6 +165,9 @@ LLM_API_KEY=
 
 # Password for the OpenCode UI and API (Basic auth user 'opencode').
 OPENCODE_PASSWORD=<generated on the first run>
+
+# Password for the Hermes web UI sign-in (username 'admin').
+HERMES_PASSWORD=<generated on the first run>
 ```
 
 The instance id comes from the directory you run in, so each project has its own settings file,
@@ -171,14 +179,18 @@ ENV_FILE=~/.local/share/agent-sandbox/instances/$INST/.env
 ```
 
 - **`LLM_API_KEY`** is injected into the in-VM OpenCode config as
-  `providers.local.settings.apiKey`, which is the key the agent sends to `--local-llm-host`.
+  `providers.local.settings.apiKey`, which is the key the agent sends to `--local-llm-host`
+  (Hermes gets the same key through its service env file and `~/.hermes/config.yaml`, which
+  `run` points at the in-VM proxy `http://10.0.2.100:11434/v1`).
   An empty value keeps the placeholder `local` that keyless servers use. Only
   letters, digits and `. _ : + / = -` are accepted, because the value ends up in JSON.
 - **`OPENCODE_PASSWORD`** signs the browser UI, the HTTP API and the OpenCode CLI. A blank
   value means "generate a new one", never "run without a password".
+- **`HERMES_PASSWORD`** signs the Hermes web UI (username `admin`). Same generated-when-blank
+  rule; the other agent's password is left untouched, so switching back and forth keeps both.
 
 **Edit the file, then rerun `agent-sandbox run` in the same directory** — a rerun with a new
-password restarts `opencode.service` with it, so the new password works and the old one stops
+password restarts the agent's service with it, so the new password works and the old one stops
 working. `run` prints the file's path and stops if the value is unusable (it never prints the
 values). The file stays on the host: it is not part of the shared workdir, so nothing inside the
 VM can read it. `clean` keeps it; `purge` deletes it along with the instance. Older releases kept
@@ -231,6 +243,22 @@ you ran `agent-sandbox run` from: a tool call that writes a file produces that
 file on the host, owned by your own uid. `GET /openapi.json` on the same port
 documents the whole API.
 
+### Connect to Hermes
+
+`run --agent hermes` prints its own port (`9500`-range by default). The Hermes web UI guards
+everything except `/health` with its own sign-in page — username `admin`, the
+`HERMES_PASSWORD` from the settings file:
+
+- **In a browser**: `http://<host address>:<hermes port>`, sign in, chat. The chat runs
+  against the same host LLM endpoint; `run` patches `~/.hermes/config.yaml` inside the VM to
+  route the model through the in-VM proxy (`http://10.0.2.100:11434/v1`).
+- **Readiness/health**: `curl http://<host address>:<hermes port>/health` (no auth needed).
+- **CLI inside the VM**: `agent-sandbox ssh agent "hermes -z 'say hello'"` — the one-shot CLI
+  needs no web login; it reads the same in-VM config. `hermes memory status` shows the
+  built-in memory stores (initialized at build under `~/.hermes`).
+- **Service**: `agent-sandbox ssh root 'systemctl status hermes-webui'`; logs at
+  `/home/agent/.local/state/hermes-webui/webui.log`.
+
 ### Sync
 
 ```bash
@@ -271,8 +299,9 @@ agent-sandbox purge     # Delete everything including the golden image
 
 | Flag | Default | Description |
 |---|---|---|
+| `--agent` | `opencode` | Which agent to start: `opencode` or `hermes` (needs a Hermes-carrying golden image) |
 | `--model` | `code` | Model served by the local LLM endpoint |
-| `--context-size` | `124000` | Context window advertised to OpenCode (output limit is half) |
+| `--context-size` | `124000` | Context window advertised to OpenCode (output limit is half; Hermes ignores it) |
 | `--vm-memory` | `4G` | VM RAM (e.g. 4G, 8G) |
 | `--vm-threads` | 80% of host | VM CPU threads |
 | `--local-llm-host` | `192.168.0.210` | Where the host-side HAProxy forwards the VM's LLM traffic (any host on your network that speaks OpenAI-compatible HTTP; `LOCAL_LLM_HOST` overrides) |
@@ -296,21 +325,26 @@ What the golden image and a running instance enforce:
 
 - **Base image**: Ubuntu Minimal — no snapd (purged at build), no docs/man pages, no build toolchain, volatile journald capped at 64 MB. The agent account is pinned to uid 1001 / gid 1002 (`VM_AGENT_UID`/`VM_AGENT_GID`) and the build aborts if that did not happen.
 - **Accounts**: a default user inherited from the base image is locked with `nologin`; SSH accepts only `agent` and `root`, publickey only, `MaxAuthTries 3`, no password/keyboard-interactive auth, no TCP forwarding or tunnels. Root has a random password that exists for the serial console only.
-- **OpenCode**: runs as an unprivileged `systemd` service with `ProtectSystem=full`, `ProtectKernelTunables`, `ProtectKernelLogs`, `PrivateTmp`; inside the VM its password lives in a root-owned `0600` env file that the agent user cannot read. Free upstream models are disabled (`OPENCODE_DISABLE_FREE_MODELS=1`).
-- **Secrets**: `LLM_API_KEY` and `OPENCODE_PASSWORD` live in a `0600` `.env` inside the instance
+- **Agents**: OpenCode and Hermes each run as an unprivileged `systemd` service with
+  `ProtectSystem=full`, `ProtectKernelTunables`, `ProtectKernelLogs`, `PrivateTmp`; inside the
+  VM their passwords live in root-owned `0600` env files (`/etc/opencode/server.env`,
+  `/etc/hermes/webui.env`) that the agent user cannot read. Free upstream models are disabled
+  (`OPENCODE_DISABLE_FREE_MODELS=1`). Exactly one agent unit is enabled at a time; `run` stops
+  and disables the other.
+- **Secrets**: `LLM_API_KEY`, `OPENCODE_PASSWORD` and `HERMES_PASSWORD` live in a `0600` `.env` inside the instance
   directory on the host (`~/.local/share/agent-sandbox/instances/<id>/.env`), never in the shared
-  workdir, so nothing inside the VM can read that file. `run` never prints either value.
+  workdir, so nothing inside the VM can read that file. `run` never prints any of them.
   `LLM_API_KEY` is injected into the agent's own `opencode.json`
   (`providers.local.settings.apiKey`), because that is where OpenCode reads provider credentials:
   an agent that can read its own config can see the key it already uses against the LLM host.
-- **Outer network layer**: QEMU's user-mode NIC runs with `restrict=on`, so the guest cannot open any outbound connection that is not one of the explicit `hostfwd`/`guestfwd` channels (SSH, the OpenCode port, the LLM proxy, the registry, the whitelist proxy).
-- **Guest firewall** (when `--dns-whitelist` is set): applied by `/usr/local/bin/agent-sandbox-firewall.sh apply`, which **fails closed** — if the nftables ruleset does not load, `agent-sandbox run` stops instead of starting an agent with no policy. The ruleset sets `input` policy `drop` (accepting only loopback, established flows, DHCP renewals, Docker-bridge DNS and the two host-forwarded ports) and DNATs every outbound 80/443 to the host's domain-whitelist proxy. `systemd-resolved` is masked and `/etc/resolv.conf` is made immutable so nothing can reopen DNS; AAAA queries are answered with NODATA because only IPv4 is proxied. `dns-proxy` and the ruleset are systemd units, so the policy survives a VM reboot.
+- **Outer network layer**: QEMU's user-mode NIC runs with `restrict=on`, so the guest cannot open any outbound connection that is not one of the explicit `hostfwd`/`guestfwd` channels (SSH, the OpenCode and Hermes web ports, the LLM proxy, the registry, the whitelist proxy).
+- **Guest firewall** (when `--dns-whitelist` is set): applied by `/usr/local/bin/agent-sandbox-firewall.sh apply`, which **fails closed** — if the nftables ruleset does not load, `agent-sandbox run` stops instead of starting an agent with no policy. The ruleset sets `input` policy `drop` (accepting only loopback, established flows, DHCP renewals, Docker-bridge DNS and the host-forwarded SSH and agent ports) and DNATs every outbound 80/443 to the host's domain-whitelist proxy. `systemd-resolved` is masked and `/etc/resolv.conf` is made immutable so nothing can reopen DNS; AAAA queries are answered with NODATA because only IPv4 is proxied. `dns-proxy` and the ruleset are systemd units, so the policy survives a VM reboot.
 - **Identity mapping**: virtiofsd maps the guest's pinned agent ids onto the host user (`--uid-map=:1001:<host uid>:1:`), which is what makes writes in `/home/agent/workdir` land on the host owned by you. If you change `VM_AGENT_UID`/`VM_AGENT_GID`, rebuild the golden image.
-- **Host side**: QEMU binds the OpenCode port to `127.0.0.1` only; HAProxy is the single host listener and publishes it on `0.0.0.0`, protected by the Basic-auth password.
+- **Host side**: QEMU binds the OpenCode and Hermes web ports to `127.0.0.1` only; HAProxy is the single host listener and publishes both on `0.0.0.0` (each behind its own password). Only the agent `run` started has a live backend; connections to the other agent's port are refused (its backend checks down).
 
 Notes:
 
 - The DNAT design needs a default route in the guest; QEMU's DHCP lease supplies an address but no router, so the policy script installs `default via 10.0.2.2` itself. With `restrict=on` that route cannot reach the internet on its own.
 - **DNS only works with `--dns-whitelist`**: the guest's `dns-proxy` unit forwards name queries to the host proxy, which resolves them on the host. QEMU's built-in user-mode resolver is unusable here, because it would have to reach the host's own resolver and a `systemd-resolved` stub lives on loopback. Without a whitelist the VM gets the LLM proxy, the registry and the shared workdir, and `run` says so. Removing the whitelist (`purge`, or a run without it) runs `agent-sandbox-firewall.sh remove`, which un-masks `systemd-resolved` and hands the VM a plain `/etc/resolv.conf` again.
 - **Firmware**: the VM boots UEFI (OVMF). The Debian/Ubuntu split pair is attached the way EDK2 expects: the code image read-only, and a per-instance copy of `OVMF_VARS_4M.fd` as the **writable variable store**. If a host only has a single combined image, that image is attached as one writable drive instead. This matters: with no writable variable store EDK2 falls back to putting its `NvVars` file on the first filesystem the *firmware* can write to, and a VM's firmware can see the virtiofs share, so that file used to turn up inside your project directory. QEMU is also started from the sandbox state directory, so any relative-path artefact stays there. Set `OVMF_CODE_SOURCE`/`OVMF_VARS_SOURCE` to use different firmware files; the copies are re-synced from their sources whenever they no longer match.
-- Add a toolchain at build time with `EXTRA_PACKAGES=...`; drop `ProtectSystem=full` in `opencode_unit_text` if a session must write outside the workdir.
+- Add a toolchain at build time with `EXTRA_PACKAGES=...`; drop `ProtectSystem=full` in the unit writers (`opencode_unit_text`, `hermes_unit_text`) if a session must write outside the workdir.
