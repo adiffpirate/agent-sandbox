@@ -2264,6 +2264,7 @@ start_opencode(){
     && systemctl daemon-reload
     && systemctl enable opencode
     && systemctl restart opencode
+    && sync
   "
   then
     echo "ERROR: could not install the OpenCode service in the VM." >&2
@@ -2532,6 +2533,7 @@ start_hermes(){
     && systemctl daemon-reload
     && systemctl enable hermes-webui
     && systemctl restart hermes-webui
+    && sync
   "
   then
     echo "ERROR: could not install the Hermes web UI service in the VM." >&2

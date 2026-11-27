@@ -102,4 +102,12 @@ grep -Fq '"\(v[0-9]' "$SB" || fail "webui tag resolver does not filter to vN rel
 declare -F wait_for_hermes >/dev/null || fail "wait_for_hermes missing"
 grep -q "http://127.0.0.1:\$HERMES_WEB_PORT/health" "$SB" || fail "health probe URL wrong"
 
+# 4g. unit files are written just before QEMU may later be SIGTERM'd: the
+#     session overlay lost file DATA (0-byte file, mtime kept) twice, which
+#     systemd reads as masked. Both writers must sync the write to the image.
+grep -A1 'systemctl restart hermes-webui' "$SB" | grep -q '&& sync' || \
+  fail "hermes unit write is not followed by sync (overlay data-loss -> masked)"
+grep -A1 'systemctl restart opencode$' "$SB" | grep -q '&& sync' || \
+  fail "opencode unit write is not followed by sync (overlay data-loss -> masked)"
+
 echo "PASS"
