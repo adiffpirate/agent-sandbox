@@ -144,6 +144,37 @@ existing habit keeps working.
 None material — corrections welcome; details above marked as builder decisions
 can be overridden now or during the plan.
 
+## Amendments from implementation (recorded at review, 2026-11-27)
+
+The design above predates the build; the shipped implementation differs in
+these ways (each deliberate):
+
+- `HERMES_VERSION` empty follows the installer's own **stable channel**, it
+  does not resolve a tag via the GitHub API (set it to pin a branch/tag name;
+  a raw SHA is not supported since the installer clones by name, shallow).
+  `HERMES_WEBUI_VERSION` empty resolves the first **release** tag (`v<digits>`)
+  from the tags API — the repo also publishes `exp-*` tags, newest-first.
+- No separate `/opt/hermes-webui/venv`: the web UI runs **in the agent's own
+  PM dependency interpreter** (a PM install has no in-tree venv; the
+  generation is recorded in `facts.json` and resolved at build by
+  `pm.environments.committed_venv` via the baked helper
+  `/usr/local/bin/agent-sandbox-hermes-vprobe.py`). Only `pyyaml` and
+  `cryptography` join that environment. The path is recorded in
+  `/etc/hermes/build-info` and consumed by `start_hermes`.
+- Run-time config: model routing is a **patch** of the installer's baked
+  `~/.hermes/config.yaml` (python-yaml, streamed through stdin, never a
+  world-writable /tmp script), not a written-out file; secrets go to the
+  root-owned `0600` `/etc/hermes/webui.env` (mirroring
+  `/etc/opencode/server.env`), not `~/.hermes/.env`.
+- Ports follow the OpenCode pattern, not 8787: the web UI binds
+  `0.0.0.0:$HERMES_VM_PORT` (`19500+offset`, the QEMU hostfwd port) and
+  HAProxy publishes `$HERMES_WEB_PORT` (`9500+offset`).
+- Sentinel gate hardened during review: `build` matches the marker anchored
+  at line start (cloud-init's `final_message` mentions the string on every
+  boot, so the old substring grep was vacuous — an aborted runcmd passed it),
+  and the uid/gid pin entries run first in runcmd (a busy-user `usermod -u`
+  failure under `set -e` silently skipped everything after it).
+
 ## Verification results (2026-11-27, this machine)
 
 Golden image: hermes v0.23.4 (2026.9.24, stable channel), hermes-webui

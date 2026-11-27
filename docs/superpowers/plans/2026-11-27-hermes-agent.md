@@ -22,7 +22,9 @@
 
 ## Review Focus
 
-- `run` without `--agent` on an image built before this change: must fail with a clear "rebuild" message, not a broken webui (stamp has no `hermes=` line).
+- `run` without `--agent` on an image built before this change: must keep
+  working exactly as before (the default stays `opencode`, whose path the
+  branch does not touch; no "rebuild" error) — ruling recorded at review.
 - `--agent hermes` with an image built before this change: same clear error.
 - Restart-in-place (`run` on an active instance) switching agents: previous agent's unit must be stopped+disabled, new one enabled, ports not left bound.
 - Password regeneration vs. reuse: rerun with unchanged `.env` keeps both passwords stable.
