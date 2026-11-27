@@ -143,3 +143,32 @@ existing habit keeps working.
 
 None material — corrections welcome; details above marked as builder decisions
 can be overridden now or during the plan.
+
+## Verification results (2026-11-27, this machine)
+
+Golden image: hermes v0.23.4 (2026.9.24, stable channel), hermes-webui
+v0.52.735; `build` green end-to-end, stamp carries both versions, the
+interpreter resolves through PM's own environment record
+(`pm.environments.committed_venv`), memory stores initialized.
+
+`run --agent hermes --local-llm-host 127.0.0.1 --local-llm-port 8080 --vm-memory 3G`
+against `tests/dev/stub-llm.py`: `tests/dev/verify-hermes.sh` PASS —
+/health 200 + login page 200 through HAProxy :10215, password login
+(username 'admin') + authenticated GET / 200, guest hermes 0.23.4 == stamp,
+webui tag checked out, `hermes memory status` ok + ~/.hermes/memories
+present, chat round trip ok. Chat proof used the documented fallback: an
+in-guest `hermes -z "say PONG"` one-shot through the same 10.0.2.100:11434
+routing the browser chat uses (the webui's chat API needs browser-shaped
+session materialization); UI proof is /health + login.
+
+Regression: default `run` (no `--agent`) starts OpenCode 2.4.2 exactly as
+before with hermes-webui stopped+disabled; hermes->opencode and
+opencode->hermes switches while running both green (mutual
+`disable --now` + unconditional unit rewrite); `stop`/`status` clean; both
+passwords stable across reruns (settings-file md5 unchanged).
+
+One observed transient: a run's `opencode.service` was once truncated to
+0 bytes (treated as masked) after QEMU was stopped mid-run — an ext4/qcow2
+durability edge of the persistent session overlay, pre-existing (same for
+any run-time-written file), and self-healing because every `run` rewrites
+its agent's unit file before enabling it.
