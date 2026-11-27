@@ -136,7 +136,7 @@ REGISTRY_CONFIG="$INSTANCE_HOME/registry.conf"
 REGISTRY_PIDFILE="$INSTANCE_HOME/registry.pid"
 REGISTRY_LOG="$INSTANCE_HOME/registry.log"
 REGISTRY_DIR="$INSTANCE_HOME/registry"
-# The settings file the user edits: LLM_API_KEY and OPENCODE_PASSWORD. It lives in
+# The settings file the user edits: LLM_API_KEY, OPENCODE_PASSWORD and HERMES_PASSWORD. It lives in
 # the per-instance directory on the host, never in the shared workdir, so nothing
 # inside the VM can read it. 'run' reads it every time: edit it, rerun.
 ENV_FILE="$INSTANCE_HOME/.env"
@@ -2018,9 +2018,9 @@ configure_vm_env() {
 }
 
 #--------------------------------------------------------------------------------
-# The instance settings file ($INSTANCE_HOME/.env): LLM_API_KEY and
-# OPENCODE_PASSWORD. Read on every run, so editing it and rerunning
-# 'agent-sandbox run' in the project directory is all it takes to change either.
+# The instance settings file ($INSTANCE_HOME/.env): LLM_API_KEY, OPENCODE_PASSWORD
+# and HERMES_PASSWORD. Read on every run, so editing it and rerunning
+# 'agent-sandbox run' in the project directory is all it takes to change them.
 # It lives on the host, outside the shared workdir, so the VM cannot read it.
 #--------------------------------------------------------------------------------
 
@@ -2957,7 +2957,7 @@ _clean(){
   if [[ -d "$INSTANCE_HOME" ]]; then
     _stop
     clean_session_files
-    echo "  Left alone on purpose: $ENV_FILE (LLM_API_KEY, OPENCODE_PASSWORD)."
+    echo "  Left alone on purpose: $ENV_FILE (LLM_API_KEY, OPENCODE_PASSWORD, HERMES_PASSWORD)."
   fi
 }
 
@@ -2987,8 +2987,8 @@ _purge(){
     delete_sandbox_dir
   fi
   if [[ "$had_settings" == "yes" ]]; then
-    echo "  Your settings file went with it: LLM_API_KEY and OPENCODE_PASSWORD are created"
-    echo "  again on the next 'agent-sandbox run' (a new password, unless you set one)."
+    echo "  Your settings file went with it: LLM_API_KEY, OPENCODE_PASSWORD and HERMES_PASSWORD are created"
+    echo "  again on the next 'agent-sandbox run' (new passwords, unless you set them)."
   fi
   sleep 3
 }
