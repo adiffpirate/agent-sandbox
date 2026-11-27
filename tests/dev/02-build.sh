@@ -10,6 +10,10 @@ log="$HOME_BASE/build-serial.log"
 [[ -f "$stamp" ]] || { echo "FAIL: no image stamp at $stamp"; exit 1; }
 grep -q '^hermes=[^ ]' "$stamp" || { echo "FAIL: stamp missing hermes= line"; exit 1; }
 grep -q '^hermes=unknown$' "$stamp" && { echo "FAIL: hermes version unresolved"; exit 1; }
+# The stamp must hold the version line itself, not a shell-trace variant of it
+# (the set -x echo line adds quotes and prefixes).
+sed -n 's/^hermes=//p' "$stamp" | grep "['[:space:]]$" && { echo "FAIL: stamp hermes line has trace junk"; exit 1; }
+true
 grep -q '^hermes-webui=[^ ]' "$stamp" || { echo "FAIL: stamp missing hermes-webui= line"; exit 1; }
 grep -q 'AS-HERMES-VERSION' "$log" || { echo "FAIL: no AS-HERMES-VERSION in build serial log"; exit 1; }
 grep -q 'agent-sandbox-provision-ok' "$log" || { echo "FAIL: provisioning sentinel missing"; exit 1; }

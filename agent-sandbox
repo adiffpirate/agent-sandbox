@@ -1067,7 +1067,8 @@ _build() {
   # cloud-init's runcmd does NOT stop at a failed entry, so this marker is the
   # only proof the Hermes install fully completed: fail the build without it.
   local hermes_installed
-  hermes_installed="$(sed -n 's/.*AS-HERMES-VERSION \([^[:cntrl:]]*\).*/\1/p' "$SANDBOX_HOME/build-serial.log" 2>/dev/null | tail -n1 || true)"
+  hermes_installed="$(sed -n 's/^AS-HERMES-VERSION //p' "$SANDBOX_HOME/build-serial.log" 2>/dev/null |
+    tail -n1 | tr -d '\r' | sed 's/[[:space:]]*$//' || true)"
   if [[ -z "$hermes_installed" ]]; then
     echo "ERROR: the Hermes install inside the build VM did not report a version." >&2
     echo "       The golden image is incomplete; see:" >&2

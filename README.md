@@ -29,7 +29,7 @@ The sandbox runs a headless Ubuntu Minimal VM using QEMU/KVM with the following 
 │  │            QEMU/KVM VM (Ubuntu Minimal)            │                 │
 │  │                                                    │                 │
 │  │  ┌──────────────┐   ┌────────────┐   ┌──────────┐  │                 │
-│  │  │  OpenCode    │   │   Docker   │   │   SSH    │  │                 │
+│  │  │  Agent*      │   │   Docker   │   │   SSH    │  │                 │
 │  │  │  (systemd)   │   │   Wrapper  │   │  :22     │  │                 │
 │  │  └──────┬───────┘   └──────┬─────┘   └─────▲────┘  │                 │
 │  │         │                  │               │       ├─────┐           │
@@ -51,13 +51,15 @@ The sandbox runs a headless Ubuntu Minimal VM using QEMU/KVM with the following 
 └────────────────────────────────────────┘
 ```
 
+(\* One agent per run: `run --agent opencode` (default) or `run --agent hermes`.)
+
 ### Key Design Decisions
 
 - **Golden image system**: The VM is built once (`agent-sandbox build`) and reused across sessions. Each run creates a throwaway overlay on top of the golden image for clean state isolation.
 - **Network isolation**: A HAProxy instance proxies LLM API calls from the VM to the host. An OCI registry runs locally for Docker image pulls. Network is restricted by default to only these services.
 - **File sharing**: The current working directory is mounted into the VM at `/home/agent/workdir` via virtiofs. The golden image carries a `nofail` fstab entry for it, so the share is also back after a guest reboot. `--workdir-ro` is enforced twice: virtiofsd runs with `--readonly` (the enforcement point, which the guest cannot bypass) and the guest mount is remounted `ro` so the mode is visible inside the VM too.
-- **Single agent**: [OpenCode V2](https://opencode.ai) is the only agent, started as a `systemd` service inside the VM and reached from the host through `opencode serve` over a password-protected HTTP endpoint.
-- **Minimal base image**: Ubuntu Minimal (`ubuntu-24.04-minimal-cloudimg`), which ships cloud-init, OpenSSH, `netplan` and a virtual kernel, but no snapd, docs, editors or toolchain. The golden image adds only `git rsync nftables ripgrep vim-tiny apparmor docker.io` plus the OpenCode binary.
+- **Two agents, one at a time**: the golden image carries both [OpenCode V2](https://opencode.ai) and [Hermes Agent](https://github.com/NousResearch/hermes-agent). `agent-sandbox run --agent opencode|hermes` starts exactly one of them as a `systemd` service inside the VM (default: `opencode`); the other is stopped and disabled. OpenCode serves `opencode serve` over a password-protected HTTP endpoint; Hermes is driven through the browser UI [hermes-webui](https://github.com/nesquena/hermes-webui) (a community project) with its own sign-in.
+- **Minimal base image**: Ubuntu Minimal (`ubuntu-24.04-minimal-cloudimg`), which ships cloud-init, OpenSSH, `netplan` and a virtual kernel, but no snapd, docs, editors or toolchain. The golden image adds only `git rsync nftables ripgrep vim-tiny apparmor docker.io python3-venv libatomic1` plus the OpenCode binary and the pinned Hermes Agent + hermes-webui installs.
 
 ## Installation
 
@@ -112,21 +114,27 @@ agent-sandbox build [--vm-memory <size>] [--vm-threads <count>] [--local-llm-hos
 ```
 
 Downloads the Ubuntu Minimal cloud image, then boots it once with cloud-init to install
-`git rsync nftables ripgrep vim-tiny apparmor docker.io`, the OpenCode V2 binary, and the Docker
+`git rsync nftables ripgrep vim-tiny apparmor docker.io python3-venv libatomic1`, the OpenCode V2
+binary, the Hermes Agent (official pinned source installer, self-contained toolchain under
+`~/.hermes`) plus the pinned hermes-webui checkout under `/opt/hermes-webui`, and the Docker
 registry wrapper. Snapd and the apt caches are removed again, so the base stays small.
 
-Pin the agent release with the environment:
+Pin agent releases with the environment:
 
 ```bash
-OPENCODE_VERSION=2.2.7 EXTRA_PACKAGES="build-essential python3-pip" agent-sandbox build
+OPENCODE_VERSION=2.2.7 HERMES_VERSION=v2026.9.24 HERMES_WEBUI_VERSION=v0.52.735 \
+  EXTRA_PACKAGES="build-essential python3-pip" agent-sandbox build
 ```
+
+(Empty `HERMES_VERSION` follows the Hermes installer's own stable channel.)
 
 The build is headless: the guest console (including all of cloud-init's output) is
 written to `~/.local/share/agent-sandbox/build-serial.log`, and provisioning counts as
 successful only when the guest prints the `agent-sandbox-provision-ok` marker from its
-last `runcmd` step. If that marker is missing, `build` prints the tail of the console
-log, throws the half-built image away and exits non-zero. Raise `BUILD_TIMEOUT`
-(seconds, default 2400) on a slow machine.
+last `runcmd` step *and* the Hermes install prints its `AS-HERMES-VERSION` marker
+(cloud-init does not stop at a failed `runcmd` entry, so the version line is the proof).
+If a marker is missing, `build` prints the tail of the console log, throws the half-built
+image away and exits non-zero. Raise `BUILD_TIMEOUT` (seconds, default 2400) on a slow machine.
 
 ### Run the agent
 
