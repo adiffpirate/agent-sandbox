@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE_EOF'
 Usage:
-  agent-sandbox run [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro] (requires prior 'build')
+  agent-sandbox run [--agent <opencode|hermes>] [--model <model>] [--context-size <size>] [--vm-memory <size>] [--vm-threads <count>] [--local-llm-host <ip>] [--local-llm-port <port>] [--restrict-network on|off] [--dns-whitelist <domains>] [--workdir-ro] (requires prior 'build')
   agent-sandbox ssh <user> <command>
   agent-sandbox build <extra_command>
   agent-sandbox sync docker [filter_regex]
@@ -14,9 +14,12 @@ Usage:
   agent-sandbox clean
   agent-sandbox purge
 
-The only agent this tool runs is OpenCode V2, as a systemd service inside the VM.
+The golden image carries two agents: OpenCode V2 and Hermes Agent (browser UI:
+hermes-webui). 'run' starts exactly one of them as a systemd service inside the
+VM; the other is stopped and disabled.
 
 Run options:
+  --agent <agent>            Which agent to start: opencode or hermes. Default: opencode
   --model <model>            Model to use. Default: code
   --context-size <size>      Maximum context window for opencode (half for output limit). Default: 124000
   --vm-memory <size>         VM RAM (e.g. 4G, 8G). Default: 4G
@@ -82,6 +85,13 @@ OPENCODE_VERSION="${OPENCODE_VERSION:-}"
 OPENCODE_TARGET="${OPENCODE_TARGET:-cli-linux-x64}"
 OPENCODE_METADATA_URL="https://opencode.ai/update/api/latest/cli/npm"
 
+# Hermes Agent release pin: a git tag or branch (installer --branch). Empty =
+# the installer's own stable channel, resolved inside the build VM.
+HERMES_VERSION="${HERMES_VERSION:-}"
+# hermes-webui (nesquena/hermes-webui) pin: a git tag. Empty = latest tag.
+HERMES_WEBUI_VERSION="${HERMES_WEBUI_VERSION:-}"
+HERMES_WEBUI_REPO_URL="https://github.com/nesquena/hermes-webui"
+
 # Extra apt packages for the golden image, e.g. EXTRA_PACKAGES="build-essential python3-pip"
 EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
 
@@ -130,6 +140,8 @@ LEGACY_ENV_FILE="$INSTANCE_HOME/opencode.env"
 # Values read from $ENV_FILE on every run.
 LLM_API_KEY=""
 OPENCODE_PASSWORD=""
+# Password for the Hermes web UI sign-in (generated when blank, like the above).
+HERMES_PASSWORD=""
 # Non-loopback address OpenCode reports for itself inside the VM; used by the
 # connect instructions ('run' never prints the loopback address).
 OPENCODE_GUEST_URL=""
@@ -154,6 +166,12 @@ OPENCODE_WEB_PORT=$((9090 + INSTANCE_PORT_OFFSET))
 # QEMU-only OpenCode port. This is intentionally bound to localhost on the host
 # and is never exposed directly to the LAN through QEMU hostfwd.
 OPENCODE_VM_PORT=$((19090 + INSTANCE_PORT_OFFSET))
+
+# LAN-facing Hermes web UI port and its QEMU-only counterpart. The guest webui
+# listens on HERMES_VM_PORT (same-port pattern as OpenCode), HAProxy republishes
+# it on 0.0.0.0:$HERMES_WEB_PORT.
+HERMES_WEB_PORT=$((9500 + INSTANCE_PORT_OFFSET))
+HERMES_VM_PORT=$((19500 + INSTANCE_PORT_OFFSET))
 
 # VM internals
 VM_NAME="agent-sandbox-$INSTANCE_ID"
@@ -181,6 +199,8 @@ VM_AGENT_GID="${VM_AGENT_GID:-1002}"
 
 CMD_DEFAULT_MODEL="code"
 CMD_DEFAULT_CONTEXT_SIZE=124000
+# Which agent 'run' starts: opencode (default) or hermes.
+CMD_AGENT="opencode"
 
 #--------------------------------------------------------------------------------
 # MAIN
@@ -219,9 +239,11 @@ main() {
       local restrict_network="$VM_RESTRICT_NETWORK"
       local workdir_ro="$VM_WORKDIR_RO"
       local dns_whitelist=""
+      local agent="$CMD_AGENT"
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
+          --agent) agent="$2"; shift 2 ;;
           --model) model="$2"; shift 2 ;;
           --context-size) context_size="$2"; shift 2 ;;
           --vm-memory) vm_memory="$2"; shift 2 ;;
@@ -235,13 +257,19 @@ main() {
         esac
       done
 
+      if [[ "$agent" != "opencode" && "$agent" != "hermes" ]]; then
+        echo "ERROR: --agent must be 'opencode' or 'hermes', not '$agent'." >&2
+        usage
+      fi
+      CMD_AGENT="$agent"
+
       VM_MEMORY_RAM="$vm_memory"
       VM_THREADS="$vm_threads"
       LOCAL_LLM_HOST="$local_llm_host"
       LOCAL_LLM_SERVER_PORT="$local_llm_server_port"
       VM_RESTRICT_NETWORK="$restrict_network"
       VM_WORKDIR_RO="$workdir_ro"
-      _run "$model" "$context_size" "$dns_whitelist"
+      _run "$model" "$context_size" "$dns_whitelist" "$agent"
       ;;
     ssh)
       local user="${1:-$VM_AGENT_USER}"
@@ -1805,7 +1833,7 @@ write_env_file(){
   if ! (
     umask 077
     cat > "$ENV_FILE" <<EOF
-# agent-sandbox settings for $INSTANCE_ID - edit these two values, then rerun
+# agent-sandbox settings for $INSTANCE_ID - edit these values, then rerun
 # 'agent-sandbox run' in the project directory this instance belongs to.
 # This file stays on the host: the VM cannot see it.
 
@@ -1815,6 +1843,10 @@ LLM_API_KEY=$LLM_API_KEY
 # Password for the OpenCode UI and API (Basic auth user 'opencode').
 # Change it here and rerun 'agent-sandbox run' to apply it.
 OPENCODE_PASSWORD=$OPENCODE_PASSWORD
+
+# Password for the Hermes web UI sign-in (username 'admin').
+# Change it here and rerun 'agent-sandbox run --agent hermes' to apply it.
+HERMES_PASSWORD=$HERMES_PASSWORD
 EOF
   ); then
     echo "ERROR: could not write $ENV_FILE." >&2
@@ -1849,6 +1881,7 @@ load_env_file(){
   migrate_workdir_env_file
   LLM_API_KEY="$(env_file_value LLM_API_KEY || true)"
   OPENCODE_PASSWORD="$(env_file_value OPENCODE_PASSWORD || true)"
+  HERMES_PASSWORD="$(env_file_value HERMES_PASSWORD || true)"
 
   # Older releases generated the password under the old file name.
   if [[ -z "$OPENCODE_PASSWORD" ]] && [[ -f "$LEGACY_ENV_FILE" ]]; then
@@ -1859,6 +1892,10 @@ load_env_file(){
   # A blank OPENCODE_PASSWORD means "generate one", never "run without a password".
   if [[ -z "$OPENCODE_PASSWORD" ]]; then
     OPENCODE_PASSWORD="$(random_password)"
+  fi
+  # Same rule for the Hermes web UI password.
+  if [[ -z "$HERMES_PASSWORD" ]]; then
+    HERMES_PASSWORD="$(random_password)"
   fi
   validate_api_key
 
@@ -2090,6 +2127,7 @@ _run(){
   local model="${1:-$CMD_DEFAULT_MODEL}"
   local context_size="${2:-$CMD_DEFAULT_CONTEXT_SIZE}"
   local dns_whitelist_csv="${3:-}"
+  local agent="${4:-$CMD_AGENT}"
 
   # Read/create the settings file first: a bad value must fail before a running
   # instance is torn down, and before any host daemon starts.
