@@ -2451,11 +2451,13 @@ disable_idle_agent(){
 # hiccup or a wedged unit must not leave both agents answering at once.
 ensure_agent_down(){
   local unit="$1" st
-  st="$(_ssh_quiet root "systemctl is-active $unit 2>/dev/null" | tr -d '[:space:]')"
+  # Remote '|| true' matters: set -euo pipefail is global, and 'systemctl
+  # is-active' exits non-zero (4) for a unit the fresh session VM never had.
+  st="$(_ssh_quiet root "systemctl is-active $unit 2>/dev/null || true" | tr -d '[:space:]')"
   if [[ "$st" == "active" ]]; then
     echo "  $unit is still active; stopping it..."
     _ssh_quiet root "systemctl stop $unit >/dev/null 2>&1 || true"
-    st="$(_ssh_quiet root "systemctl is-active $unit 2>/dev/null" | tr -d '[:space:]')"
+    st="$(_ssh_quiet root "systemctl is-active $unit 2>/dev/null || true" | tr -d '[:space:]')"
   fi
   if [[ "$st" == "active" ]]; then
     echo "ERROR: $unit.service is still active; refusing to run two agents at once." >&2
@@ -2495,8 +2497,11 @@ start_hermes(){
   # re-deriving the generation path at run time would read PM internals the
   # image, not this script, owns.
   local agent_python agent_dir
-  agent_python="$(_ssh_quiet root "sed -n 's/^agent_python=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
-  agent_dir="$(_ssh_quiet root "sed -n 's/^agent_dir=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
+  # '|| true' on the REMOTE command: ssh forwards sed's exit 2 for a missing
+  # file, which set -euo pipefail would turn into a silent script death
+  # instead of the clear error below.
+  agent_python="$(_ssh_quiet root "sed -n 's/^agent_python=//p' /etc/hermes/build-info 2>/dev/null || true" | tr -d '[:space:]')"
+  agent_dir="$(_ssh_quiet root "sed -n 's/^agent_dir=//p' /etc/hermes/build-info 2>/dev/null || true" | tr -d '[:space:]')"
   if [[ -z "$agent_python" || -z "$agent_dir" ]]; then
     echo "ERROR: the golden image has no Hermes build record (/etc/hermes/build-info)." >&2
     echo "       Re-run 'agent-sandbox build'." >&2

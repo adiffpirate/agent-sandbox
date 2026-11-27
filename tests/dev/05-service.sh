@@ -78,6 +78,13 @@ true
 grep -c "systemctl is-active" "$SB" | grep -qE '^[2-9]' || fail "no post-disable verification of the idle agent"
 grep -q 'ensure_agent_down opencode' "$SB" || fail "hermes path does not verify opencode is down"
 grep -q 'ensure_agent_down hermes-webui' "$SB" || fail "opencode path does not verify hermes-webui is down"
+# 'set -euo pipefail' is global: an ssh capture whose REMOTE command exits
+# non-zero (is-active on a missing unit exits 4; sed on a missing file exits
+# 2) kills the script mid-run. Those captures must neutralize the remote exit.
+grep -q 'systemctl is-active \$unit 2>/dev/null || true' "$SB" || \
+  fail "is-active capture can trip set -e (remote exit code not absorbed)"
+grep -q "build-info 2>/dev/null || true" "$SB" || \
+  fail "build-info capture can trip set -e (missing-file exit not absorbed)"
 
 # 4e. _purge's stop loop must follow the recompute_instance_paths rule.
 awk '/^_purge\(\)\{/{f=1} f{print} f&&/delete_sandbox_dir/{exit}' "$SB" > "$SCRATCH/purge.sh"
