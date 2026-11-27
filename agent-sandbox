@@ -848,6 +848,7 @@ write_files:
       set -eux
       hermes_ref="\$1"; webui_tag="\$2"; hermes_mode="\${3:-stable}"
       agent_home="/home/$VM_AGENT_USER"
+      repo="\$agent_home/.hermes/hermes-agent"
 
       # 1. The agent: official installer (pinned toolchain it verifies itself),
       # without the browser / computer-use extras (out of sandbox scope).
@@ -858,24 +859,38 @@ write_files:
       fi
       runuser -l $VM_AGENT_USER -c "\$agent_home/.local/bin/hermes --version"
 
-      # 2. The web UI (pinned tag). It runs the agent in-process on the
-      # agent's own venv, so only two extra Python packages are needed.
+      # 2. The web UI (pinned tag). It runs the agent in-process, so it must
+      # execute on the agent's own dependency interpreter.
       git clone --depth 1 --branch "\$webui_tag" $HERMES_WEBUI_REPO_URL /opt/hermes-webui
-      agent_python="\$agent_home/.hermes/hermes-agent/.venv/bin/python"
-      if [ ! -x "\$agent_python" ]; then
-        # Fallback: whatever python the 'hermes' launcher wrapper execs.
-        agent_python="\$(sed -n 's/^exec[[:space:]]\{1,\}\([^[:space:]]*python[[:space:]]*\).*/\1/p' "\$agent_home/.local/bin/hermes" | head -n1)"
+
+      # 3. Find that interpreter. A PM-managed install (the installer's git
+      # method) has NO in-tree venv: uv environments live under
+      # ~/.hermes/installs/<key>/environments/<generation> and facts.json
+      # records the selected one. Ask PM's own resolver (pm.environments),
+      # run by the installer's own store Python (~/.hermes/tools/python-*/),
+      # exactly like the checkout's scripts/_activation.sh does.
+      store_py="\$(ls "\$agent_home/.hermes"/tools/python-*/bin/python3 2>/dev/null | head -n1)"
+      agent_python=""
+      if [ -n "\$store_py" ]; then
+        agent_python="\$(runuser -l $VM_AGENT_USER -c "PYTHONPATH=\$repo '\$store_py' /usr/local/bin/agent-sandbox-hermes-vprobe.py '\$repo'" 2>/dev/null || true)"
       fi
       if [ ! -x "\$agent_python" ]; then
         echo "ERROR: could not locate the Hermes agent venv python." >&2
-        ls -l "\$agent_home/.hermes" "\$agent_home/.hermes/hermes-agent" >&2 || true
+        ls -l "\$agent_home/.hermes" "\$agent_home/.hermes/tools" >&2 || true
+        ls -l "\$agent_home/.hermes/installs" 2>/dev/null >&2 || true
+        cat "\$agent_home/.hermes/installs"/*/facts.json 2>/dev/null >&2 || true
         exit 1
       fi
-      if ! "\$agent_python" -c 'import yaml, cryptography'; then
-        uv_bin="\$agent_home/.hermes/bin/uv"
+      # The web UI's own two dependencies (requirements.txt) join the agent
+      # environment; the bootstrap re-exec into it needs them present there.
+      if ! "\$agent_python" -c 'import yaml, cryptography' 2>/dev/null; then
+        uv_bin="\$(ls "\$agent_home/.hermes"/tools/uv-*/uv 2>/dev/null | head -n1)"
         [ -x "\$uv_bin" ] || uv_bin="\$(command -v uv)"
-        "\$uv_bin" pip install --python "\$agent_python" pyyaml cryptography
+        runuser -l $VM_AGENT_USER -c "'\$uv_bin' pip install --python '\$agent_python' pyyaml cryptography"
       fi
+      # Record what the run-time unit needs (start_hermes reads this file).
+      mkdir -p /etc/hermes
+      printf 'agent_python=%s\nagent_dir=%s\n' "\$agent_python" "\$repo" > /etc/hermes/build-info
 
       # 3. Memory backend: initialize HERMES_HOME at build so the built-in
       # stores (memories/MEMORY.md + USER.md, SQLite/FTS5 session db) exist and
@@ -891,6 +906,28 @@ write_files:
       # also the proof that every step above ran: 'build' fails without it.
       hermes_ver="\$(runuser -l $VM_AGENT_USER -c "\$agent_home/.local/bin/hermes --version" | head -n1)"
       echo "AS-HERMES-VERSION \$hermes_ver" > /dev/console
+  - path: /usr/local/bin/agent-sandbox-hermes-vprobe.py
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env python3
+      # Print the dependency interpreter of a PM-managed Hermes install.
+      # PM records the selected environment generation in facts.json; the
+      # checkout's own pm.environments module is the only component that
+      # knows how to read that record, so we call it instead of guessing
+      # in-tree venv paths (a PM install has none). Runs on Hermes' store
+      # Python, with the checkout on PYTHONPATH (like scripts/_activation.sh).
+      import sys
+      from pathlib import Path
+
+      repo = Path(sys.argv[1]).resolve()
+      sys.path.insert(0, str(repo))
+      from pm.environments import committed_venv, venv_python
+
+      env = committed_venv(repo) or Path(repo).resolve() / "venv"
+      py = venv_python(env)
+      if not py.is_file():
+          sys.exit(f"no usable Hermes dependency interpreter found (tried: {py})")
+      print(py)
 
 # Always power off: 'build' decides success from the marker in the serial log.
 # A condition here would leave QEMU running forever on any cloud-init warning,

@@ -28,6 +28,12 @@ grep -q '  - python3-venv' "$USER_DATA" || { echo "FAIL: python3-venv package mi
 grep -q '  - libatomic1' "$USER_DATA" || { echo "FAIL: libatomic1 package missing"; exit 1; }
 grep -q 'nesquena/hermes-webui' "$USER_DATA" || { echo "FAIL: hermes-webui clone missing"; exit 1; }
 grep -q 'hermes memory status' "$USER_DATA" || { echo "FAIL: memory-backend init missing"; exit 1; }
+# The agent venv must be resolved THROUGH PM (a PM-managed install has no
+# in-tree venv; the generation lives under ~/.hermes/installs/*/environments/
+# and facts.json records it), never by guessing in-tree .venv paths.
+grep -q 'agent-sandbox-hermes-vprobe.py' "$USER_DATA" || { echo "FAIL: venv-probe helper not baked into write_files"; exit 1; }
+grep -q 'committed_venv' "$USER_DATA" || { echo "FAIL: installer does not resolve the venv via pm.environments"; exit 1; }
+grep -q '/etc/hermes/build-info' "$USER_DATA" || { echo "FAIL: build-info record (agent_python for run-time) missing"; exit 1; }
 # runuser lines must reference $agent_home, never $HOME: the builder shell runs
 # under 'set -u' with no HOME (cloud-init runcmd), and the outer shell expands
 # double-quoted arguments before the guest shell ever sees them.
