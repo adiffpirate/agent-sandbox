@@ -202,6 +202,32 @@ CMD_DEFAULT_CONTEXT_SIZE=124000
 # Which agent 'run' starts: opencode (default) or hermes.
 CMD_AGENT="opencode"
 
+# Re-derive every path built from $INSTANCE_HOME. Callers that repoint
+# INSTANCE_HOME (the stop-all loops) must call this, or the globals keep
+# pointing at whichever instance happened to be current at script start.
+recompute_instance_paths() {
+  SESSION_IMAGE="$INSTANCE_HOME/vm-session-disk.qcow2"
+  OVMF_VARS_COPY="$INSTANCE_HOME/OVMF_VARS.fd"
+  FS_SOCK="$INSTANCE_HOME/virtiofsd.sock"
+  QEMU_PIDFILE="$INSTANCE_HOME/qemu.pid"
+  QEMU_LOG="$INSTANCE_HOME/qemu.log"
+  VIRTIOFSD_PIDFILE="$INSTANCE_HOME/virtiofsd.pid"
+  VIRTIOFSD_LOG="$INSTANCE_HOME/virtiofsd.log"
+  HAPROXY_CONFIG="$INSTANCE_HOME/haproxy.conf"
+  HAPROXY_PIDFILE="$INSTANCE_HOME/haproxy.pid"
+  HAPROXY_LOG="$INSTANCE_HOME/haproxy.log"
+  REGISTRY_CONFIG="$INSTANCE_HOME/registry.conf"
+  REGISTRY_PIDFILE="$INSTANCE_HOME/registry.pid"
+  REGISTRY_LOG="$INSTANCE_HOME/registry.log"
+  REGISTRY_DIR="$INSTANCE_HOME/registry"
+  ENV_FILE="$INSTANCE_HOME/.env"
+  LEGACY_ENV_FILE="$INSTANCE_HOME/opencode.env"
+  HOST_PROXY_SCRIPT="$INSTANCE_HOME/host_proxy.py"
+  HOST_PROXY_PIDFILE="$INSTANCE_HOME/host_proxy.pid"
+  HOST_PROXY_LOG="$INSTANCE_HOME/host_proxy.log"
+  WHITELIST_FILE="$INSTANCE_HOME/dns-whitelist.txt"
+}
+
 #--------------------------------------------------------------------------------
 # MAIN
 #--------------------------------------------------------------------------------
@@ -830,7 +856,7 @@ write_files:
       else
         runuser -l $VM_AGENT_USER -c "curl -fsSL --retry 5 https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --non-interactive --skip-browser --skip-computer-use"
       fi
-      runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes --version"
+      runuser -l $VM_AGENT_USER -c "\$agent_home/.local/bin/hermes --version"
 
       # 2. The web UI (pinned tag). It runs the agent in-process on the
       # agent's own venv, so only two extra Python packages are needed.
@@ -855,13 +881,15 @@ write_files:
       # stores (memories/MEMORY.md + USER.md, SQLite/FTS5 session db) exist and
       # report healthy before the first boot. doctor may warn; memory status
       # must pass.
-      runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes doctor" || echo "WARNING: hermes doctor reported issues (see build log)"
-      runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes memory status"
-      runuser -l $VM_AGENT_USER -c "test -d \$HOME/.hermes/memories"
+      runuser -l $VM_AGENT_USER -c "\$agent_home/.local/bin/hermes doctor" || echo "WARNING: hermes doctor reported issues (see build log)"
+      runuser -l $VM_AGENT_USER -c "\$agent_home/.local/bin/hermes memory status"
+      runuser -l $VM_AGENT_USER -c "test -d \$agent_home/.hermes/memories"
 
       # 4. Report the installed version to the serial console so 'build' can
       # record it in the image stamp (same channel as PROVISION_SENTINEL).
-      hermes_ver="\$(runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes --version" | head -n1)"
+      # cloud-init keeps going after a failed runcmd entry, so this marker is
+      # also the proof that every step above ran: 'build' fails without it.
+      hermes_ver="\$(runuser -l $VM_AGENT_USER -c "\$agent_home/.local/bin/hermes --version" | head -n1)"
       echo "AS-HERMES-VERSION \$hermes_ver" > /dev/console
 
 # Always power off: 'build' decides success from the marker in the serial log.
@@ -953,13 +981,18 @@ build_golden_image() {
 # base image: re-fetching 250 MB on every rebuild is pure waste. Use 'purge' to
 # throw that away too.
 _clean_build_artefacts() {
-  local instance_dir
+  local instance_dir saved_instance="$INSTANCE_HOME"
   for instance_dir in "$SANDBOX_HOME"/instances/*/; do
     if [[ -d "$instance_dir" ]]; then
-      INSTANCE_HOME="$instance_dir"
+      INSTANCE_HOME="${instance_dir%/}"
+      recompute_instance_paths
       _stop
     fi
   done
+  # Restore the current project's instance and re-derive its paths: the rm below
+  # must target this instance's files, not the last one the loop visited.
+  INSTANCE_HOME="$saved_instance"
+  recompute_instance_paths
   rm -f "$GOLDEN_IMAGE" "$SESSION_IMAGE" "$SEED_ISO" "$USER_DATA" "$META_DATA" \
         "$OVMF_CODE_COPY" "$OVMF_VARS_COPY" "$IMAGE_STAMP" \
         "$SANDBOX_HOME/build-serial.log"
@@ -994,9 +1027,17 @@ _build() {
 
   # The agent reports its installed version to the serial console during
   # provisioning (AS-HERMES-VERSION); the web UI tag was chosen host-side.
+  # cloud-init's runcmd does NOT stop at a failed entry, so this marker is the
+  # only proof the Hermes install fully completed: fail the build without it.
   local hermes_installed
-  hermes_installed="$(sed -n 's/^AS-HERMES-VERSION //p' "$SANDBOX_HOME/build-serial.log" 2>/dev/null | tail -n1 | tr -d '\r[:space:]' || true)"
-  [[ -n "$hermes_installed" ]] || hermes_installed="unknown"
+  hermes_installed="$(sed -n 's/.*AS-HERMES-VERSION \([^[:cntrl:]]*\).*/\1/p' "$SANDBOX_HOME/build-serial.log" 2>/dev/null | tail -n1 || true)"
+  if [[ -z "$hermes_installed" ]]; then
+    echo "ERROR: the Hermes install inside the build VM did not report a version." >&2
+    echo "       The golden image is incomplete; see:" >&2
+    echo "         $SANDBOX_HOME/build-serial.log" >&2
+    rm -f "$GOLDEN_IMAGE"
+    exit 1
+  fi
 
   {
     printf 'base_image=%s\n' "$DOWNLOAD_IMAGE"
@@ -1062,20 +1103,11 @@ host_ipv4_addresses() {
   ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | head -3
 }
 
-start_haproxy(){
-  if is_running haproxy; then
-    echo "haproxy already running, skipping"
-    return
-  fi
-
-  if nc -z "127.0.0.1" $HAPROXY_LISTEN_PORT > /dev/null 2>&1; then
-    echo "ERROR: Port $HAPROXY_LISTEN_PORT already in use" >&2
-    exit 1
-  fi
-
-  echo "Starting haproxy (LLM :$HAPROXY_LISTEN_PORT, OpenCode :$OPENCODE_WEB_PORT)..."
-
-  cat > "$HAPROXY_CONFIG" <<EOF
+# The HAProxy config as text (testable without binding ports). Only the agent
+# chosen by 'run --agent' actually listens inside the VM; the other agent's
+# backend sits checked-down and its frontend answers 503.
+haproxy_config_text(){
+  cat <<EOF
 global
   log stdout format raw local0
   maxconn 256
@@ -1110,7 +1142,35 @@ backend opencode_out
   server opencode 127.0.0.1:$OPENCODE_VM_PORT check
   timeout connect 2s
   timeout server 1h
+
+# The Hermes web UI follows the same pattern (web UI login, not Basic auth).
+frontend hermes_in
+  mode tcp
+  bind 0.0.0.0:$HERMES_WEB_PORT
+  default_backend hermes_out
+
+backend hermes_out
+  mode tcp
+  server hermes 127.0.0.1:$HERMES_VM_PORT check
+  timeout connect 2s
+  timeout server 1h
 EOF
+}
+
+start_haproxy(){
+  if is_running haproxy; then
+    echo "haproxy already running, skipping"
+    return
+  fi
+
+  if nc -z "127.0.0.1" $HAPROXY_LISTEN_PORT > /dev/null 2>&1; then
+    echo "ERROR: Port $HAPROXY_LISTEN_PORT already in use" >&2
+    exit 1
+  fi
+
+  echo "Starting haproxy (LLM :$HAPROXY_LISTEN_PORT, OpenCode :$OPENCODE_WEB_PORT, Hermes :$HERMES_WEB_PORT)..."
+
+  haproxy_config_text > "$HAPROXY_CONFIG"
 
   nohup haproxy -f "$HAPROXY_CONFIG" -db -d > "$HAPROXY_LOG" 2>&1 &
   local pid=$!
@@ -1724,6 +1784,7 @@ table ip sandbox_filter {
     # SSH, plus the OpenCode port that HAProxy on the host connects to.
     ip saddr 10.0.2.2 tcp dport 22 accept
     ip saddr 10.0.2.2 tcp dport $OPENCODE_VM_PORT accept
+    ip saddr 10.0.2.2 tcp dport $HERMES_VM_PORT accept
   }
 }
 NFT
@@ -1817,7 +1878,7 @@ start_qemu() {
       -drive "file=$SESSION_IMAGE,if=virtio,format=qcow2" \
       \
       -device "virtio-net-pci,netdev=host" \
-      -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_VM_PORT-:$OPENCODE_VM_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:$HOST_PROXY_PORT-cmd:socat - TCP:127.0.0.1:$HOST_PROXY_PORT" \
+      -netdev "user,id=host,restrict=$VM_RESTRICT_NETWORK,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$OPENCODE_VM_PORT-:$OPENCODE_VM_PORT,hostfwd=tcp:127.0.0.1:$HERMES_VM_PORT-:$HERMES_VM_PORT,guestfwd=tcp:10.0.2.100:11434-cmd:socat - TCP:127.0.0.1:$HAPROXY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:5000-cmd:socat - TCP:127.0.0.1:$REGISTRY_LISTEN_PORT,guestfwd=tcp:10.0.2.100:$HOST_PROXY_PORT-cmd:socat - TCP:127.0.0.1:$HOST_PROXY_PORT" \
       \
       -object "memory-backend-memfd,id=mem,size=$VM_MEMORY_RAM,share=on" \
       -numa "node,memdev=mem" \

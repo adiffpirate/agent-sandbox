@@ -28,5 +28,11 @@ grep -q '  - python3-venv' "$USER_DATA" || { echo "FAIL: python3-venv package mi
 grep -q '  - libatomic1' "$USER_DATA" || { echo "FAIL: libatomic1 package missing"; exit 1; }
 grep -q 'nesquena/hermes-webui' "$USER_DATA" || { echo "FAIL: hermes-webui clone missing"; exit 1; }
 grep -q 'hermes memory status' "$USER_DATA" || { echo "FAIL: memory-backend init missing"; exit 1; }
+# runuser lines must reference $agent_home, never $HOME: the builder shell runs
+# under 'set -u' with no HOME (cloud-init runcmd), and the outer shell expands
+# double-quoted arguments before the guest shell ever sees them.
+awk '/path: \/usr\/local\/bin\/agent-sandbox-install-hermes/{f=1;next} f&&/^chpasswd:/{exit} f' "$USER_DATA" \
+  | grep -q '"\$HOME' && { echo "FAIL: installer uses \"\$HOME (expands in builder shell)"; exit 1; }
+true
 python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$USER_DATA" || { echo "FAIL: user-data is not valid YAML"; exit 1; }
 echo "PASS"
