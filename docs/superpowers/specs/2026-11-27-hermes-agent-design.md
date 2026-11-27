@@ -201,5 +201,7 @@ passwords stable across reruns (settings-file md5 unchanged).
 One observed transient: a run's `opencode.service` was once truncated to
 0 bytes (treated as masked) after QEMU was stopped mid-run — an ext4/qcow2
 durability edge of the persistent session overlay, pre-existing (same for
-any run-time-written file), and self-healing because every `run` rewrites
-its agent's unit file before enabling it.
+any run-time-written file). It reproduced once more on the rebuilt image,
+which pinpoints it rather than exonerates it: both service-install chains
+now end with `&& sync` (commit 2937e1e), and every `run` rewrites its
+agent's unit file before enabling it, so the state self-heals either way.
