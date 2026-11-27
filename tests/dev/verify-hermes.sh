@@ -65,7 +65,7 @@ webui_stamp="$(sed -n 's/^hermes-webui=//p' "$stamp" | head -n1)"
 # (describe is unreliable here: the clone is shallow and the upstream tag
 # object is annotated; asserting the pinned tag ref exists + HEAD is present
 # is the honest equivalent of "this checkout is that tag".)
-guest agent "git -C /opt/hermes-webui tag -l '$webui_stamp' | grep -qx '$webui_stamp' && git -C /opt/hermes-webui rev-parse --verify -q 'refs/tags/$webui_stamp'" >/dev/null || \
+guest root "git -C /opt/hermes-webui tag -l '$webui_stamp' | grep -qx '$webui_stamp' && git -C /opt/hermes-webui rev-parse --verify -q 'refs/tags/$webui_stamp'" >/dev/null || \
   fail "hermes-webui checkout is not at tag $webui_stamp"
 echo "  versions ok: hermes $ver_guest, webui tag $webui_stamp checked out"
 
