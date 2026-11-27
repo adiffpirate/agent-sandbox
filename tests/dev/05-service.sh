@@ -43,6 +43,7 @@ assert m["base_url"] == "http://10.0.2.100:11434/v1", m
 assert m.get("stream") is True, "unrelated model keys must survive"
 assert c["unrelated"]["keep"] == 42, "unrelated sections must survive"
 assert c.get("memory", {}).get("memory_enabled") is True, "memory not enabled"
+assert c.get("memory", {}).get("user_profile_enabled") is True, "user profile not enabled"
 PY
 
 # 3. unit text: runs the webui on the recorded interpreter, as the agent user.
@@ -56,8 +57,35 @@ grep -q 'hermes-webui' <<<"$unit" || fail "unit name/description missing"
 # 4. wiring in _run: stamp guard + dispatch + mutual unit disable.
 grep -q "grep -q '^hermes=' \"\$IMAGE_STAMP\"" "$SB" || fail "stamp guard for --agent hermes missing"
 grep -q 'start_hermes "\$model"' "$SB" || fail "start_hermes not dispatched in _run"
-grep -q 'systemctl disable --now hermes-webui' "$SB" || fail "hermes unit not disabled by the opencode path"
-grep -q 'systemctl disable --now opencode' "$SB" || fail "opencode unit not disabled by the hermes path"
+grep -q 'disable_idle_agent hermes-webui' "$SB" || fail "hermes unit not disabled by the opencode path"
+grep -q 'disable_idle_agent opencode' "$SB" || fail "opencode unit not disabled by the hermes path"
+
+# 4b. the hermes stamp guard must fire BEFORE a running instance is torn down
+#     (extract _run's body and check the relative order).
+awk '/^_run\(\)\{/{f=1} f{print} f&&/^\}$/{exit}' "$SB" > "$SCRATCH/_run.sh"
+g_pos="$(grep -n 'hermes=.*IMAGE_STAMP' "$SCRATCH/_run.sh" | head -n1 | cut -d: -f1)"
+s_pos="$(grep -n 'already running' "$SCRATCH/_run.sh" | head -n1 | cut -d: -f1)"
+[[ -n "$g_pos" && -n "$s_pos" && "$g_pos" -lt "$s_pos" ]] || fail "stamp guard runs after the instance teardown"
+grep -q 'disable_idle_agent' "$SCRATCH/_run.sh" || fail "_run does not disable the idle agent early (boot autostart window)"
+
+# 4c. never execute a world-writable /tmp script as root: the config patch
+#     must stream straight into the interpreter.
+grep -q "base64 -d | '\$agent_python' - " "$SB" || fail "config patch is not piped through stdin (root /tmp exec)"
+grep -q "/tmp/hermes-config-patch.py" "$SB" && fail "root still executes a /tmp path"
+true
+
+# 4d. after the mutual disable, the starter must verify the other agent is down.
+grep -c "systemctl is-active" "$SB" | grep -qE '^[2-9]' || fail "no post-disable verification of the idle agent"
+grep -q 'ensure_agent_down opencode' "$SB" || fail "hermes path does not verify opencode is down"
+grep -q 'ensure_agent_down hermes-webui' "$SB" || fail "opencode path does not verify hermes-webui is down"
+
+# 4e. _purge's stop loop must follow the recompute_instance_paths rule.
+awk '/^_purge\(\)\{/{f=1} f{print} f&&/delete_sandbox_dir/{exit}' "$SB" > "$SCRATCH/purge.sh"
+grep -q 'recompute_instance_paths' "$SCRATCH/purge.sh" || fail "_purge loop repoints INSTANCE_HOME without recomputing paths"
+grep -q 'instance_dir%/' "$SCRATCH/purge.sh" || fail "_purge loop keeps the trailing slash on INSTANCE_HOME"
+
+# 4f. the webui tag resolver must skip non-release tags (exp-* publishes exist).
+grep -Fq '"\(v[0-9]' "$SB" || fail "webui tag resolver does not filter to vN release tags"
 
 # 5. readiness waiter exists and targets the webui port.
 declare -F wait_for_hermes >/dev/null || fail "wait_for_hermes missing"

@@ -12,6 +12,10 @@ bash -n "$SB" || fail "syntax error in agent-sandbox"
 # 1. usage documents --agent
 "$SB" 2>&1 | grep -q -- '--agent' || fail "usage does not document --agent"
 
+# 1b. usage documents the Hermes build pins
+"$SB" 2>&1 | grep -q 'HERMES_VERSION ' || fail "usage does not list HERMES_VERSION"
+"$SB" 2>&1 | grep -q 'HERMES_WEBUI_VERSION ' || fail "usage does not list HERMES_WEBUI_VERSION"
+
 # 2. usage still lists OpenCode as the default agent
 "$SB" 2>&1 | grep -qi -- '--agent' | true
 

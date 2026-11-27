@@ -40,5 +40,20 @@ grep -q '/etc/hermes/build-info' "$USER_DATA" || { echo "FAIL: build-info record
 awk '/path: \/usr\/local\/bin\/agent-sandbox-install-hermes/{f=1;next} f&&/^chpasswd:/{exit} f' "$USER_DATA" \
   | grep -q '"\$HOME' && { echo "FAIL: installer uses \"\$HOME (expands in builder shell)"; exit 1; }
 true
+# The uid/gid pin entries must run BEFORE anything can leave processes owned
+# by the agent user ('usermod -u' refuses a user with live processes, and the
+# runcmd shell dies there under set -e, hiding the loss behind the marker gates).
+awk '/^runcmd:/{f=1} f' "$USER_DATA" > "$SCRATCH/runcmd.yaml"
+pin_line="$(grep -m1 -n 'usermod -u' "$SCRATCH/runcmd.yaml" | cut -d: -f1)"
+hermes_line="$(grep -m1 -n '  - agent-sandbox-install-hermes.sh' "$SCRATCH/runcmd.yaml" | cut -d: -f1)"
+[[ -n "$pin_line" && -n "$hermes_line" && "$pin_line" -lt "$hermes_line" ]] || \
+  { echo "FAIL: uid/gid pin runs after the Hermes install (busy-user abort risk)"; exit 1; }
+grep -q 'pkill -u' "$SCRATCH/runcmd.yaml" || \
+  { echo "FAIL: no belt-and-braces pkill before the uid change"; exit 1; }
+# final_message must not quote the sentinel: cloud-init prints it on EVERY
+# boot, so a substring 'grep' for the provision marker would never fail.
+awk '/^final_message:/{f=1} f' "$USER_DATA" | grep -q 'agent-sandbox-provision-ok' && \
+  { echo "FAIL: final_message quotes the provision sentinel (makes the gate vacuous)"; exit 1; }
+true
 python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$USER_DATA" || { echo "FAIL: user-data is not valid YAML"; exit 1; }
 echo "PASS"

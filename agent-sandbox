@@ -48,6 +48,11 @@ Environment overrides:
   OPENCODE_VERSION           Pin the OpenCode V2 version (default: latest)
   OPENCODE_TARGET            Platform package (default: cli-linux-x64).
                              Use cli-linux-x64-baseline on CPUs without AVX2.
+  HERMES_VERSION             Pin the Hermes Agent git tag/branch (default: the
+                             installer's stable channel). Not a commit SHA: the
+                             installer clones by name, and its checkout is
+                             shallow.
+  HERMES_WEBUI_VERSION       Pin the hermes-webui tag (default: latest release tag)
   EXTRA_PACKAGES             Space-separated apt packages to add to the golden image
 USAGE_EOF
   exit 1
@@ -443,7 +448,9 @@ resolve_opencode_version() {
   echo "$version"
 }
 
-# Resolve the hermes-webui tag once per build (cached; honors the pin).
+# Resolve the hermes-webui tag once per build (honors the pin). The repo
+# publishes experimental "exp-*" tags and the tags API is newest-first, so
+# pick the first RELEASE tag (v<digits>), not just the first tag.
 HERMES_WEBUI_RESOLVED=""
 resolve_hermes_webui_version() {
   if [[ -n "$HERMES_WEBUI_VERSION" ]]; then
@@ -455,8 +462,8 @@ resolve_hermes_webui_version() {
     return
   fi
   local meta version
-  meta="$(curl -fsSL --max-time 30 "https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=1" 2>/dev/null || true)"
-  version="$(sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$meta" | head -n1)"
+  meta="$(curl -fsSL --max-time 30 "https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=30" 2>/dev/null || true)"
+  version="$(sed -n 's/.*"name":[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p' <<< "$meta" | head -n1)"
   if [[ -z "$version" ]]; then
     echo "ERROR: Could not resolve the latest hermes-webui tag from GitHub." >&2
     echo "       Pin it with HERMES_WEBUI_VERSION=<tag> and retry." >&2
@@ -743,6 +750,20 @@ runcmd:
   # cloud-init runs this file with /bin/sh, which is dash on Ubuntu, so stay
   # POSIX: 'set -o pipefail' is a bashism that would abort the whole script.
   - set -eux
+  # --- Pin the agent account to the ids virtiofsd maps onto the host user ---
+  # cloud-init assigns the first free ids, which vary by base image; the shared
+  # workdir only works when the guest ids match virtiofsd's uid/gid maps.
+  # This must be the FIRST step: 'usermod -u' refuses a user that has live
+  # processes, and agent installs create some (the Hermes installer leaves
+  # helper processes owned by the agent user behind). pkill is belt-and-braces
+  # for anything already running under that account when runcmd starts.
+  - getent group $VM_AGENT_USER || groupadd -g $VM_AGENT_GID $VM_AGENT_USER
+  - groupmod -g $VM_AGENT_GID $VM_AGENT_USER
+  - pkill -u $VM_AGENT_USER || true
+  - usermod -u $VM_AGENT_UID $VM_AGENT_USER
+  - chown -R $VM_AGENT_UID:$VM_AGENT_GID /home/$VM_AGENT_USER
+  - id $VM_AGENT_USER
+  - test "\$(id -u $VM_AGENT_USER)" = "$VM_AGENT_UID" && test "\$(id -g $VM_AGENT_USER)" = "$VM_AGENT_GID"
   # --- The one agent: OpenCode V2 (glibc build, no node/npm runtime needed) ---
   - curl -fsSL --retry 5 -o /tmp/opencode.tgz "https://registry.npmjs.org/@opencode%2f$OPENCODE_TARGET/-/$OPENCODE_TARGET-$version.tgz"
   - tar -xzf /tmp/opencode.tgz -C /tmp
@@ -759,15 +780,6 @@ runcmd:
   - rm -rf /var/lib/apt/lists/*
   # --- Keep the image's own default user unusable, if the base image has one ---
   - usermod -L -s /usr/sbin/nologin ubuntu || true
-  # --- Pin the agent account to the ids virtiofsd maps onto the host user ---
-  # cloud-init assigns the first free ids, which vary by base image; the shared
-  # workdir only works when the guest ids match virtiofsd's uid/gid maps.
-  - getent group $VM_AGENT_USER || groupadd -g $VM_AGENT_GID $VM_AGENT_USER
-  - groupmod -g $VM_AGENT_GID $VM_AGENT_USER
-  - usermod -u $VM_AGENT_UID $VM_AGENT_USER
-  - chown -R $VM_AGENT_UID:$VM_AGENT_GID /home/$VM_AGENT_USER
-  - id $VM_AGENT_USER
-  - test "\$(id -u $VM_AGENT_USER)" = "$VM_AGENT_UID" && test "\$(id -g $VM_AGENT_USER)" = "$VM_AGENT_GID"
   # --- Docker, reachable by the agent user through the socket group ---
   # The group is created by the docker.io package, so this runs after the
   # package install step of the same cloud-init pass.
@@ -791,8 +803,13 @@ runcmd:
   - sync
   # Run extra cmd
   - bash -c '$extra_cmd'
-  # Reaching this line means every step above succeeded. 'build' greps the
-  # serial log for this marker; the guest console is the serial port.
+  # This marker proves cloud-init REACHED the end of runcmd: the entries
+  # share one shell with 'set -e', so the first failing entry aborts the
+  # rest, including this echo. 'build' greps the serial log for the marker
+  # anchored at line start, which nothing else in the log can fake (the
+  # xtrace line and the final_message both carry a cloud-init prefix).
+  # AS-HERMES-VERSION is a second marker: it proves the Hermes step
+  # specifically and carries its version into the image stamp.
   - echo $PROVISION_SENTINEL > /dev/console
 
 chpasswd:
@@ -938,8 +955,8 @@ power_state:
 
 final_message: |
   agent-sandbox: cloud-init reached its final stage.
-  If "$PROVISION_SENTINEL" is missing from the console log, provisioning failed:
-  investigate the cloud-init logs shown above.
+  If the end-of-runcmd console marker is missing from the console log,
+  provisioning failed: investigate the cloud-init logs shown above.
 EOF
 
   cat >"$META_DATA" <<EOF
@@ -997,8 +1014,11 @@ build_golden_image() {
     exit 1
   fi
 
-  # qemu exiting cleanly is not enough: cloud-init can fail and still shut down.
-  if ! grep -q "$PROVISION_SENTINEL" "$serial_log" 2>/dev/null; then
+  # qemu exiting cleanly is not enough: cloud-init can fail and still shut
+  # down. The marker must match at LINE START: it is the only way a bare
+  # console echo differs from a cloud-init-prefixed line (xtrace, final
+  # message) that merely mentions the same string.
+  if ! grep -aq "^${PROVISION_SENTINEL}" "$serial_log" 2>/dev/null; then
     echo "ERROR: cloud-init did not finish provisioning the image." >&2
     echo "       Look for 'Failed to run' / 'Invalid config' lines in:" >&2
     echo "         $serial_log" >&2
@@ -1143,7 +1163,8 @@ host_ipv4_addresses() {
 
 # The HAProxy config as text (testable without binding ports). Only the agent
 # chosen by 'run --agent' actually listens inside the VM; the other agent's
-# backend sits checked-down and its frontend answers 503.
+# backend sits checked-down, and connections to its frontend are refused
+# (mode tcp with no live server: HAProxy closes, it does not emit an HTTP 503).
 haproxy_config_text(){
   cat <<EOF
 global
@@ -1205,6 +1226,14 @@ start_haproxy(){
     echo "ERROR: Port $HAPROXY_LISTEN_PORT already in use" >&2
     exit 1
   fi
+  # HAProxy also binds the two agent web ports; checking them here turns a
+  # squatted port into a clear message instead of a generic haproxy timeout.
+  for web_port in "$OPENCODE_WEB_PORT" "$HERMES_WEB_PORT"; do
+    if nc -z "127.0.0.1" "$web_port" > /dev/null 2>&1; then
+      echo "ERROR: Port $web_port already in use (HAProxy publishes the agent UIs there)" >&2
+      exit 1
+    fi
+  done
 
   echo "Starting haproxy (LLM :$HAPROXY_LISTEN_PORT, OpenCode :$OPENCODE_WEB_PORT, Hermes :$HERMES_WEB_PORT)..."
 
@@ -2193,8 +2222,10 @@ start_opencode(){
   echo
   echo "Starting OpenCode V2 as a systemd service..."
 
-  # Only one agent runs at a time: release the other one's ports and unit.
-  _ssh root "systemctl disable --now hermes-webui >/dev/null 2>&1 || true" || true
+  # Only one agent runs at a time: release the other one's ports and unit,
+  # and prove it is really down before starting ours.
+  disable_idle_agent hermes-webui
+  ensure_agent_down hermes-webui
 
   # _ssh() intentionally removes newlines from remote commands, so do not
   # use heredocs here. Encode the small config/service files instead.
@@ -2226,7 +2257,7 @@ start_opencode(){
     && printf '%s' '$opencode_config_b64' | base64 -d > /home/$VM_AGENT_USER/.config/opencode/opencode.json
     && chown $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.config/opencode/opencode.json
     && install -d -m 0755 /etc/opencode
-    && printf '%s' '$opencode_env_b64' | base64 -d > /etc/opencode/server.env
+    && ( umask 077; printf '%s' '$opencode_env_b64' | base64 -d > /etc/opencode/server.env )
     && chmod 0600 /etc/opencode/server.env
     && printf '%s' '$opencode_unit_b64' | base64 -d > /etc/systemd/system/opencode.service
     && chmod 0644 /etc/systemd/system/opencode.service
@@ -2355,6 +2386,7 @@ mem = cfg.get("memory")
 if not isinstance(mem, dict):
     mem = cfg["memory"] = {}
 mem.setdefault("memory_enabled", True)
+mem.setdefault("user_profile_enabled", True)
 yaml.safe_dump(cfg, open(path, "w"), sort_keys=False)
 PY
 }
@@ -2407,6 +2439,31 @@ hermes_unit_text(){
   }
 }
 
+# Disable the agent this run will NOT start, as early as the guest lets us:
+# a unit enabled by an earlier run autostarts at guest boot, so waiting until
+# the chosen agent's install step would leave the idle UI reachable (with its
+# old password) through HAProxy for the length of VM boot.
+disable_idle_agent(){
+  _ssh root "systemctl disable --now $1 >/dev/null 2>&1 || true" || true
+}
+
+# Fail closed on the invariant "exactly one agent runs": a swallowed ssh
+# hiccup or a wedged unit must not leave both agents answering at once.
+ensure_agent_down(){
+  local unit="$1" st
+  st="$(_ssh_quiet root "systemctl is-active $unit 2>/dev/null" | tr -d '[:space:]')"
+  if [[ "$st" == "active" ]]; then
+    echo "  $unit is still active; stopping it..."
+    _ssh_quiet root "systemctl stop $unit >/dev/null 2>&1 || true"
+    st="$(_ssh_quiet root "systemctl is-active $unit 2>/dev/null" | tr -d '[:space:]')"
+  fi
+  if [[ "$st" == "active" ]]; then
+    echo "ERROR: $unit.service is still active; refusing to run two agents at once." >&2
+    echo "       Run 'agent-sandbox stop', then try again." >&2
+    exit 1
+  fi
+}
+
 # /health is unauthenticated (the login gate guards everything else), which
 # makes it a plain readiness probe.
 wait_for_hermes(){
@@ -2446,8 +2503,10 @@ start_hermes(){
     exit 1
   fi
 
-  # Only one agent runs at a time: release the other one's ports and unit.
-  _ssh root "systemctl disable --now opencode >/dev/null 2>&1 || true" || true
+  # Only one agent runs at a time: release the other one's ports and unit,
+  # and prove it is really down before starting ours.
+  disable_idle_agent opencode
+  ensure_agent_down opencode
 
   local config_patch_b64 webui_env_b64 webui_unit_b64
   config_patch_b64="$(hermes_config_patch_text "$model" | base64 -w0)"
@@ -2457,13 +2516,11 @@ start_hermes(){
   # The command embeds the web UI password and the LLM key, so it is not echoed.
   if ! _ssh_quiet root "
     install -d -m 0755 /etc/hermes
-    && printf '%s' '$webui_env_b64' | base64 -d > /etc/hermes/webui.env
+    && ( umask 077; printf '%s' '$webui_env_b64' | base64 -d > /etc/hermes/webui.env )
     && chmod 0600 /etc/hermes/webui.env
     && mkdir -p /home/$VM_AGENT_USER/.local/state/hermes-webui
     && chown -R $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.local /home/$VM_AGENT_USER/.local/state /home/$VM_AGENT_USER/.local/state/hermes-webui
-    && printf '%s' '$config_patch_b64' | base64 -d > /tmp/hermes-config-patch.py
-    && '$agent_python' /tmp/hermes-config-patch.py '/home/'"$VM_AGENT_USER"'/.hermes/config.yaml'
-    && rm -f /tmp/hermes-config-patch.py
+    && printf '%s' '$config_patch_b64' | base64 -d | '$agent_python' - '$agent_dir/../.hermes/config.yaml'
     && chown $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.hermes/config.yaml
     && printf '%s' '$webui_unit_b64' | base64 -d > /etc/systemd/system/hermes-webui.service
     && chmod 0644 /etc/systemd/system/hermes-webui.service
@@ -2534,15 +2591,6 @@ _run(){
   # instance is torn down, and before any host daemon starts.
   load_env_file
 
-  if is_running qemu; then
-    echo "============================================================"
-    echo " Instance $INSTANCE_ID already running."
-    echo " Stopping and restarting with updated settings..."
-    echo "============================================================"
-    _stop
-    sleep 2
-  fi
-
   if [[ ! -f "$GOLDEN_IMAGE" ]]; then
     echo "ERROR: Golden image not found. Run 'agent-sandbox build' first."
     exit 1
@@ -2550,11 +2598,20 @@ _run(){
 
   # An image built before the Hermes agent has no hermes line in its stamp:
   # 'run --agent hermes' on such an image would start a VM with no web UI at
-  # all. Say so instead of timing out in wait_for_hermes.
+  # all. Say so before touching the live instance, not after.
   if [[ "$agent" == "hermes" ]] && ! { [[ -f "$IMAGE_STAMP" ]] && grep -q '^hermes=' "$IMAGE_STAMP"; }; then
     echo "ERROR: this golden image predates the Hermes agent." >&2
     echo "       Run 'agent-sandbox build' to bake Hermes Agent + hermes-webui in." >&2
     exit 1
+  fi
+
+  if is_running qemu; then
+    echo "============================================================"
+    echo " Instance $INSTANCE_ID already running."
+    echo " Stopping and restarting with updated settings..."
+    echo "============================================================"
+    _stop
+    sleep 2
   fi
 
   if [[ -f "$IMAGE_STAMP" ]] && ! grep -q "^base_image=$DOWNLOAD_IMAGE$" "$IMAGE_STAMP"; then
@@ -2586,6 +2643,12 @@ _run(){
 
   start_qemu
   wait_for_ssh
+  # Kill the other agent's autostart before its port can serve anything.
+  if [[ "$agent" == "hermes" ]]; then
+    disable_idle_agent opencode
+  else
+    disable_idle_agent hermes-webui
+  fi
   mount_workdir
   configure_vm_env
 
@@ -2911,13 +2974,16 @@ _purge(){
   local had_settings="no"
   [[ -f "$ENV_FILE" ]] && had_settings="yes"
   if [[ -d "$SANDBOX_HOME" ]]; then
+    local saved_instance="$INSTANCE_HOME"
     for instance_dir in "$SANDBOX_HOME"/instances/*/; do
       if [[ -d "$instance_dir" ]]; then
-        INSTANCE_HOME="$instance_dir"
+        INSTANCE_HOME="${instance_dir%/}"
+        recompute_instance_paths
         _stop
       fi
     done
-    INSTANCE_HOME="$SANDBOX_HOME/instances/$INSTANCE_ID"
+    INSTANCE_HOME="$saved_instance"
+    recompute_instance_paths
     delete_sandbox_dir
   fi
   if [[ "$had_settings" == "yes" ]]; then
