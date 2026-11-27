@@ -2192,6 +2192,9 @@ start_opencode(){
   echo
   echo "Starting OpenCode V2 as a systemd service..."
 
+  # Only one agent runs at a time: release the other one's ports and unit.
+  _ssh root "systemctl disable --now hermes-webui >/dev/null 2>&1 || true" || true
+
   # _ssh() intentionally removes newlines from remote commands, so do not
   # use heredocs here. Encode the small config/service files instead.
   local opencode_config_b64
@@ -2319,6 +2322,204 @@ wait_for_opencode(){
 }
 
 #--------------------------------------------------------------------------------
+# Hermes Agent runtime: model routing, web UI env, systemd unit, readiness
+#
+# Mirrors the OpenCode trio (config + env file + unit, all base64-piped in one
+# non-echoed root command). The interpreter that runs the web UI is the agent's
+# PM dependency environment, recorded at build time in /etc/hermes/build-info;
+# the web UI's bootstrap re-enters the agent checkout in that same interpreter.
+#--------------------------------------------------------------------------------
+
+# Python that updates the baked config.yaml in place: model routing points at
+# the in-VM LLM proxy (10.0.2.100:11434, the address OpenCode uses) and the
+# built-in memory stores are switched on. Every other setting the installer's
+# config carries survives untouched. Takes the config path as argv[1].
+hermes_config_patch_text(){
+  local model="$1"
+  cat <<PY
+import sys, yaml
+path = sys.argv[1]
+try:
+    cfg = yaml.safe_load(open(path)) or {}
+except (OSError, ValueError):
+    cfg = {}
+if not isinstance(cfg, dict):
+    cfg = {}
+model_cfg = cfg.get("model")
+if not isinstance(model_cfg, dict):
+    model_cfg = cfg["model"] = {}
+model_cfg.update({"default": "$model", "provider": "custom",
+                  "base_url": "http://10.0.2.100:11434/v1"})
+mem = cfg.get("memory")
+if not isinstance(mem, dict):
+    mem = cfg["memory"] = {}
+mem.setdefault("memory_enabled", True)
+yaml.safe_dump(cfg, open(path, "w"), sort_keys=False)
+PY
+}
+
+# Root-owned env file for the web UI unit (mirrors /etc/opencode/server.env:
+# systemd reads it before dropping privileges, so the agent user never sees
+# the password through the service's own environment).
+hermes_webui_env_text(){
+  local model="$1" agent_python="$2"
+  printf '%s\n' \
+    'HERMES_WEBUI_HOST=0.0.0.0' \
+    "HERMES_WEBUI_PORT=$HERMES_VM_PORT" \
+    "HERMES_WEBUI_PASSWORD=$HERMES_PASSWORD" \
+    "HERMES_HOME=/home/$VM_AGENT_USER/.hermes" \
+    "HERMES_WEBUI_AGENT_DIR=/home/$VM_AGENT_USER/.hermes/hermes-agent" \
+    "HERMES_WEBUI_PYTHON=$agent_python" \
+    "HERMES_INFERENCE_MODEL=$model" \
+    "OPENAI_API_KEY=${LLM_API_KEY:-local}" \
+    "OPENAI_BASE_URL=http://10.0.2.100:11434/v1"
+}
+
+hermes_unit_text(){
+  {
+    printf '%s\n' '[Unit]'
+    printf '%s\n' 'Description=Hermes Agent web UI (agent-sandbox)'
+    printf '%s\n' 'After=network-online.target docker.service'
+    printf '%s\n' 'Wants=docker.service'
+    printf '%s\n' ''
+    printf '%s\n' '[Service]'
+    printf '%s\n' 'Type=simple'
+    printf '%s\n' 'User='"$VM_AGENT_USER"
+    printf '%s\n' 'Group='"$VM_AGENT_USER"
+    printf '%s\n' 'WorkingDirectory=/home/'"$VM_AGENT_USER"
+    printf '%s\n' 'Environment=HOME=/home/'"$VM_AGENT_USER"
+    printf '%s\n' 'EnvironmentFile=/etc/hermes/webui.env'
+    printf '%s\n' 'ExecStart='"$HERMES_AGENT_PYTHON"' /opt/hermes-webui/server.py'
+    printf '%s\n' 'Restart=always'
+    printf '%s\n' 'RestartSec=2'
+    printf '%s\n' 'StandardOutput=append:/home/'"$VM_AGENT_USER"'/.local/state/hermes-webui/webui.log'
+    printf '%s\n' 'StandardError=append:/home/'"$VM_AGENT_USER"'/.local/state/hermes-webui/webui.err'
+    printf '%s\n' '# Same hardening set as opencode.service; see the note there.'
+    printf '%s\n' 'ProtectSystem=full'
+    printf '%s\n' 'ProtectKernelTunables=yes'
+    printf '%s\n' 'ProtectKernelLogs=yes'
+    printf '%s\n' 'PrivateTmp=yes'
+    printf '%s\n' 'LimitNOFILE=65536'
+    printf '%s\n' ''
+    printf '%s\n' '[Install]'
+    printf '%s\n' 'WantedBy=multi-user.target'
+  }
+}
+
+# /health is unauthenticated (the login gate guards everything else), which
+# makes it a plain readiness probe.
+wait_for_hermes(){
+  local tries=30
+
+  echo "Waiting for the Hermes web UI on port $HERMES_WEB_PORT..."
+  while [[ "$tries" -gt 0 ]]; do
+    if curl -sf -m 3 "http://127.0.0.1:$HERMES_WEB_PORT/health" >/dev/null 2>&1; then
+      echo "Hermes web UI is answering on :$HERMES_WEB_PORT"
+      return 0
+    fi
+    sleep 2.5
+    tries=$((tries - 1))
+  done
+
+  echo "ERROR: the Hermes web UI did not answer on port $HERMES_WEB_PORT." >&2
+  _ssh root "systemctl status hermes-webui --no-pager; journalctl -u hermes-webui -n 40 --no-pager; tail -n 40 /home/$VM_AGENT_USER/.local/state/hermes-webui/webui.log /home/$VM_AGENT_USER/.local/state/hermes-webui/webui.err" || true
+  exit 1
+}
+
+start_hermes(){
+  local model=$1
+  local context_size=$2
+
+  echo
+  echo "Starting Hermes Agent (hermes-webui) as a systemd service..."
+
+  # The build stamped the agent's PM interpreter into /etc/hermes/build-info;
+  # re-deriving the generation path at run time would read PM internals the
+  # image, not this script, owns.
+  local agent_python agent_dir
+  agent_python="$(_ssh root "sed -n 's/^agent_python=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
+  agent_dir="$(_ssh root "sed -n 's/^agent_dir=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
+  if [[ -z "$agent_python" || -z "$agent_dir" ]]; then
+    echo "ERROR: the golden image has no Hermes build record (/etc/hermes/build-info)." >&2
+    echo "       Re-run 'agent-sandbox build'." >&2
+    exit 1
+  fi
+
+  # Only one agent runs at a time: release the other one's ports and unit.
+  _ssh root "systemctl disable --now opencode >/dev/null 2>&1 || true" || true
+
+  local config_patch_b64 webui_env_b64 webui_unit_b64
+  config_patch_b64="$(hermes_config_patch_text "$model" | base64 -w0)"
+  webui_env_b64="$(hermes_webui_env_text "$model" "$agent_python" | base64 -w0)"
+  webui_unit_b64="$(HERMES_AGENT_PYTHON="$agent_python" hermes_unit_text | base64 -w0)"
+
+  # The command embeds the web UI password and the LLM key, so it is not echoed.
+  if ! _ssh_quiet root "
+    install -d -m 0755 /etc/hermes
+    && printf '%s' '$webui_env_b64' | base64 -d > /etc/hermes/webui.env
+    && chmod 0600 /etc/hermes/webui.env
+    && mkdir -p /home/$VM_AGENT_USER/.local/state/hermes-webui
+    && chown -R $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.local /home/$VM_AGENT_USER/.local/state /home/$VM_AGENT_USER/.local/state/hermes-webui
+    && printf '%s' '$config_patch_b64' | base64 -d > /tmp/hermes-config-patch.py
+    && '$agent_python' /tmp/hermes-config-patch.py '/home/'"$VM_AGENT_USER"'/.hermes/config.yaml'
+    && rm -f /tmp/hermes-config-patch.py
+    && chown $VM_AGENT_USER:$VM_AGENT_USER /home/$VM_AGENT_USER/.hermes/config.yaml
+    && printf '%s' '$webui_unit_b64' | base64 -d > /etc/systemd/system/hermes-webui.service
+    && chmod 0644 /etc/systemd/system/hermes-webui.service
+    && systemctl daemon-reload
+    && systemctl enable hermes-webui
+    && systemctl restart hermes-webui
+  "
+  then
+    echo "ERROR: could not install the Hermes web UI service in the VM." >&2
+    exit 1
+  fi
+
+  wait_for_hermes
+
+  local -a lan_addrs=()
+  mapfile -t lan_addrs < <(host_ipv4_addresses)
+  local lan_url="http://<this host's address>:$HERMES_WEB_PORT"
+  [[ ${#lan_addrs[@]} -gt 0 ]] && lan_url="http://${lan_addrs[0]}:$HERMES_WEB_PORT"
+
+  echo
+  echo "============================================================"
+  echo "Hermes Agent is running inside the VM as a systemd service (hermes-webui)."
+  echo
+  echo "  Settings: $ENV_FILE"
+  echo "    LLM_API_KEY      the key the agent sends to $LOCAL_LLM_HOST:$LOCAL_LLM_SERVER_PORT"
+  echo "    HERMES_PASSWORD  sign-in password for the web UI (username 'admin')"
+  echo "  Edit that file (mode 0600, host-side, never shared with the VM) and rerun"
+  echo "  'agent-sandbox run --agent hermes' here to change either one. Passwords are not printed here."
+  echo
+  echo "  Connect to the agent (published on 0.0.0.0, protected by the web UI login):"
+  echo
+  if [[ ${#lan_addrs[@]} -gt 0 ]]; then
+    printf '    Browser     http://%s:%s\n' "${lan_addrs[0]}" "$HERMES_WEB_PORT"
+    for ip in "${lan_addrs[@]:1}"; do
+      printf '                http://%s:%s\n' "$ip" "$HERMES_WEB_PORT"
+    done
+  else
+    printf '    Browser     %s\n' "$lan_url"
+  fi
+  echo "              sign in with username 'admin' and the HERMES_PASSWORD from the"
+  echo "              settings file; the chat runs against $LOCAL_LLM_HOST:$LOCAL_LLM_SERVER_PORT."
+  echo
+  echo "    Health      curl http://127.0.0.1:$HERMES_WEB_PORT/health"
+  echo
+  echo "    Hermes CLI, inside the VM (as $VM_AGENT_USER):"
+  printf '                agent-sandbox ssh %s "hermes -z %ssay hello%s"\n' \
+    "$VM_AGENT_USER" "'" "'"
+  echo "                The one-shot CLI needs no login: it inherits the model routing"
+  echo "                from ~/.hermes/config.yaml inside the VM."
+  echo
+  echo "  Status:  agent-sandbox ssh root 'systemctl status hermes-webui'"
+  echo "  Logs:    agent-sandbox ssh root 'tail -n 50 /home/$VM_AGENT_USER/.local/state/hermes-webui/webui.log'"
+  echo "============================================================"
+  echo
+}
+
+#--------------------------------------------------------------------------------
 # _run: orchestrates full startup (with restart-if-running logic)
 #--------------------------------------------------------------------------------
 
@@ -2343,6 +2544,15 @@ _run(){
 
   if [[ ! -f "$GOLDEN_IMAGE" ]]; then
     echo "ERROR: Golden image not found. Run 'agent-sandbox build' first."
+    exit 1
+  fi
+
+  # An image built before the Hermes agent has no hermes line in its stamp:
+  # 'run --agent hermes' on such an image would start a VM with no web UI at
+  # all. Say so instead of timing out in wait_for_hermes.
+  if [[ "$agent" == "hermes" ]] && ! { [[ -f "$IMAGE_STAMP" ]] && grep -q '^hermes=' "$IMAGE_STAMP"; }; then
+    echo "ERROR: this golden image predates the Hermes agent." >&2
+    echo "       Run 'agent-sandbox build' to bake Hermes Agent + hermes-webui in." >&2
     exit 1
   fi
 
@@ -2389,7 +2599,11 @@ _run(){
     fi
   fi
 
-  start_opencode "$model" "$context_size"
+  if [[ "$agent" == "hermes" ]]; then
+    start_hermes "$model" "$context_size"
+  else
+    start_opencode "$model" "$context_size"
+  fi
 }
 
 #--------------------------------------------------------------------------------
