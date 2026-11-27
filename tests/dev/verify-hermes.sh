@@ -26,6 +26,17 @@ WEB="http://127.0.0.1:$HERMES_WEB_PORT"
 stamp="$SANDBOX_HOME/vm-image.stamp"
 envf="$INSTANCE_HOME/.env"
 
+# 'agent-sandbox ssh' echoes the command to stdout first; drop that line and
+# ssh's host-key noise to keep captures clean, while keeping the remote exit
+# status (a pipeline would hide it behind tail's own status).
+guest(){
+  local u="$1"; shift
+  local out rc
+  out="$("$SB" ssh "$u" "$*" 2>/dev/null)"; rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out" | tail -n +2
+  return $rc
+}
+
 # 1. readiness + auth surface through HAProxy.
 code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$WEB/health" || true)"
 [[ "$code" == "200" ]] || fail "/health on :$HERMES_WEB_PORT returned '$code'"
@@ -45,7 +56,7 @@ noauth_code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$WEB/api/auth/status
 echo "  login ok; authenticated GET / = $auth_code"
 
 # 3. guest-side agent health, versions matching the image stamp.
-ver_guest="$($SB ssh agent "/home/$VM_AGENT_USER/.local/bin/hermes --version" 2>/dev/null |
+ver_guest="$(guest agent "/home/$VM_AGENT_USER/.local/bin/hermes --version" |
   sed -n 's/.*v\([0-9][0-9.]*\).*/\1/p' | head -n1)"
 ver_stamp="$(sed -n 's/^hermes=.*v\([0-9][0-9.]*\).*/\1/p' "$stamp" | head -n1)"
 [[ -n "$ver_guest" && "$ver_guest" == "$ver_stamp" ]] || \
@@ -54,20 +65,20 @@ webui_stamp="$(sed -n 's/^hermes-webui=//p' "$stamp" | head -n1)"
 # (describe is unreliable here: the clone is shallow and the upstream tag
 # object is annotated; asserting the pinned tag ref exists + HEAD is present
 # is the honest equivalent of "this checkout is that tag".)
-$SB ssh agent "git -C /opt/hermes-webui tag -l '$webui_stamp' | grep -qx '$webui_stamp' && git -C /opt/hermes-webui rev-parse --verify -q 'refs/tags/$webui_stamp'" >/dev/null 2>&1 || \
+guest agent "git -C /opt/hermes-webui tag -l '$webui_stamp' | grep -qx '$webui_stamp' && git -C /opt/hermes-webui rev-parse --verify -q 'refs/tags/$webui_stamp'" >/dev/null || \
   fail "hermes-webui checkout is not at tag $webui_stamp"
 echo "  versions ok: hermes $ver_guest, webui tag $webui_stamp checked out"
 
 # 4. memory backend alive at run time.
-$SB ssh agent "/home/$VM_AGENT_USER/.local/bin/hermes memory status" >/dev/null 2>&1 || \
+guest agent "/home/$VM_AGENT_USER/.local/bin/hermes memory status" >/dev/null || \
   fail "hermes memory status failed in the guest"
-$SB ssh agent "test -d /home/$VM_AGENT_USER/.hermes/memories" || \
+guest agent "test -d /home/$VM_AGENT_USER/.hermes/memories" || \
   fail "~/.hermes/memories missing in the guest"
 echo "  memory backend ok"
 
 # 5. chat round trip: config.yaml inside the VM points the agent at the host
 # LLM proxy; the stub answers 'PONG' only when the prompt reached it.
-reply="$($SB ssh agent "OPENAI_API_KEY=local /home/$VM_AGENT_USER/.local/bin/hermes -z 'say PONG'" 2>/dev/null || true)"
+reply="$(guest agent "OPENAI_API_KEY=local /home/$VM_AGENT_USER/.local/bin/hermes -z 'say PONG'" || true)"
 grep -q 'PONG' <<<"$reply" || fail "one-shot chat did not round-trip (reply: ${reply:0:300})"
 echo "  chat round-trip ok"
 

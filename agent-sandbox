@@ -2438,8 +2438,8 @@ start_hermes(){
   # re-deriving the generation path at run time would read PM internals the
   # image, not this script, owns.
   local agent_python agent_dir
-  agent_python="$(_ssh root "sed -n 's/^agent_python=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
-  agent_dir="$(_ssh root "sed -n 's/^agent_dir=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
+  agent_python="$(_ssh_quiet root "sed -n 's/^agent_python=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
+  agent_dir="$(_ssh_quiet root "sed -n 's/^agent_dir=//p' /etc/hermes/build-info 2>/dev/null" | tr -d '[:space:]')"
   if [[ -z "$agent_python" || -z "$agent_dir" ]]; then
     echo "ERROR: the golden image has no Hermes build record (/etc/hermes/build-info)." >&2
     echo "       Re-run 'agent-sandbox build'." >&2
