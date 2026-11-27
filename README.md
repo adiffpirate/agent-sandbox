@@ -58,7 +58,7 @@ The sandbox runs a headless Ubuntu Minimal VM using QEMU/KVM with the following 
 - **Golden image system**: The VM is built once (`agent-sandbox build`) and reused across sessions. Each run creates a throwaway overlay on top of the golden image for clean state isolation.
 - **Network isolation**: A HAProxy instance proxies LLM API calls from the VM to the host. An OCI registry runs locally for Docker image pulls. Network is restricted by default to only these services.
 - **File sharing**: The current working directory is mounted into the VM at `/home/agent/workdir` via virtiofs. The golden image carries a `nofail` fstab entry for it, so the share is also back after a guest reboot. `--workdir-ro` is enforced twice: virtiofsd runs with `--readonly` (the enforcement point, which the guest cannot bypass) and the guest mount is remounted `ro` so the mode is visible inside the VM too.
-- **Two agents, one at a time**: the golden image carries both [OpenCode V2](https://opencode.ai) and [Hermes Agent](https://github.com/NousResearch/hermes-agent). `agent-sandbox run --agent opencode|hermes` starts exactly one of them as a `systemd` service inside the VM (default: `opencode`); the other is stopped and disabled. OpenCode serves `opencode serve` over a password-protected HTTP endpoint; Hermes is driven through the browser UI [hermes-webui](https://github.com/nesquena/hermes-webui) (a community project) with its own sign-in.
+- **Two agents, one at a time, one port**: the golden image carries both [OpenCode V2](https://opencode.ai) and [Hermes Agent](https://github.com/NousResearch/hermes-agent). `agent-sandbox run --agent opencode|hermes` starts exactly one of them as a `systemd` service inside the VM (default: `opencode`); the other is stopped and disabled. Whichever one runs is published on the same port, so the URL never changes: OpenCode serves `opencode serve` over a password-protected HTTP endpoint; Hermes is driven through the browser UI [hermes-webui](https://github.com/nesquena/hermes-webui) (a community project) with its own sign-in.
 - **Minimal base image**: Ubuntu Minimal (`ubuntu-24.04-minimal-cloudimg`), which ships cloud-init, OpenSSH, `netplan` and a virtual kernel, but no snapd, docs, editors or toolchain. The golden image adds only `git rsync nftables ripgrep vim-tiny apparmor docker.io python3-venv libatomic1` plus the OpenCode binary and the pinned Hermes Agent + hermes-webui installs.
 
 ## Installation
@@ -245,14 +245,16 @@ documents the whole API.
 
 ### Connect to Hermes
 
-`run --agent hermes` prints its own port (`9500`-range by default). The Hermes web UI guards
-everything except `/health` with its own sign-in page — username `admin`, the
+`run --agent hermes` publishes the Hermes web UI on the **same port as OpenCode**
+(`9805` in the examples above; exactly one agent runs at a time, so they share it). The Hermes
+web UI guards everything except `/health` with its own sign-in page — username `admin`, the
 `HERMES_PASSWORD` from the settings file:
 
-- **In a browser**: `http://<host address>:<hermes port>`, sign in, chat. The chat runs
+- **In a browser**: `http://<host address>:<agent port>`, sign in, chat. The chat runs
   against the same host LLM endpoint; `run` patches `~/.hermes/config.yaml` inside the VM to
   route the model through the in-VM proxy (`http://10.0.2.100:11434/v1`).
-- **Readiness/health**: `curl http://<host address>:<hermes port>/health` (no auth needed).
+- **Readiness/health**: `curl http://<host address>:<agent port>/health` (no auth needed;
+  while OpenCode runs instead, that port speaks OpenCode's API rather than this).
 - **CLI inside the VM**: `agent-sandbox ssh agent "hermes -z 'say hello'"` — the one-shot CLI
   needs no web login; it reads the same in-VM config. `hermes memory status` shows the
   built-in memory stores (initialized at build under `~/.hermes`).
@@ -337,10 +339,10 @@ What the golden image and a running instance enforce:
   `LLM_API_KEY` is injected into the agent's own `opencode.json`
   (`providers.local.settings.apiKey`), because that is where OpenCode reads provider credentials:
   an agent that can read its own config can see the key it already uses against the LLM host.
-- **Outer network layer**: QEMU's user-mode NIC runs with `restrict=on`, so the guest cannot open any outbound connection that is not one of the explicit `hostfwd`/`guestfwd` channels (SSH, the OpenCode and Hermes web ports, the LLM proxy, the registry, the whitelist proxy).
+- **Outer network layer**: QEMU's user-mode NIC runs with `restrict=on`, so the guest cannot open any outbound connection that is not one of the explicit `hostfwd`/`guestfwd` channels (SSH, the shared agent web port, the LLM proxy, the registry, the whitelist proxy).
 - **Guest firewall** (when `--dns-whitelist` is set): applied by `/usr/local/bin/agent-sandbox-firewall.sh apply`, which **fails closed** — if the nftables ruleset does not load, `agent-sandbox run` stops instead of starting an agent with no policy. The ruleset sets `input` policy `drop` (accepting only loopback, established flows, DHCP renewals, Docker-bridge DNS and the host-forwarded SSH and agent ports) and DNATs every outbound 80/443 to the host's domain-whitelist proxy. `systemd-resolved` is masked and `/etc/resolv.conf` is made immutable so nothing can reopen DNS; AAAA queries are answered with NODATA because only IPv4 is proxied. `dns-proxy` and the ruleset are systemd units, so the policy survives a VM reboot.
 - **Identity mapping**: virtiofsd maps the guest's pinned agent ids onto the host user (`--uid-map=:1001:<host uid>:1:`), which is what makes writes in `/home/agent/workdir` land on the host owned by you. If you change `VM_AGENT_UID`/`VM_AGENT_GID`, rebuild the golden image.
-- **Host side**: QEMU binds the OpenCode and Hermes web ports to `127.0.0.1` only; HAProxy is the single host listener and publishes both on `0.0.0.0` (each behind its own password). Only the agent `run` started has a live backend; connections to the other agent's port are refused (its backend checks down).
+- **Host side**: QEMU binds the shared agent port to `127.0.0.1` only; HAProxy is the single host listener and publishes it on `0.0.0.0`, behind the active agent's own sign-in (Basic auth for OpenCode, web login for Hermes). Exactly one agent unit runs, so one process owns the port end to end; with nothing running, HAProxy's health check fails and connections are refused.
 
 Notes:
 

@@ -16,7 +16,7 @@ fail() { echo "FAIL: $1"; exit 1; }
 #    the agent dir and the interpreter recorded at build time.
 env_text="$(hermes_webui_env_text 'test-model' '/opt/pm/venv/bin/python')"
 grep -q '^HERMES_WEBUI_HOST=0.0.0.0$' <<<"$env_text" || fail "webui must bind 0.0.0.0"
-grep -q "^HERMES_WEBUI_PORT=$HERMES_VM_PORT$" <<<"$env_text" || fail "webui port wrong"
+grep -q "^HERMES_WEBUI_PORT=$AGENT_VM_PORT$" <<<"$env_text" || fail "webui port wrong"
 grep -q '^HERMES_WEBUI_PASSWORD=' <<<"$env_text" || fail "webui password missing"
 grep -q "^HERMES_WEBUI_AGENT_DIR=/home/$VM_AGENT_USER/.hermes/hermes-agent$" <<<"$env_text" || fail "agent dir missing"
 grep -q '^HERMES_WEBUI_PYTHON=/opt/pm/venv/bin/python$' <<<"$env_text" || fail "agent python missing"
@@ -100,7 +100,7 @@ grep -Fq '"\(v[0-9]' "$SB" || fail "webui tag resolver does not filter to vN rel
 
 # 5. readiness waiter exists and targets the webui port.
 declare -F wait_for_hermes >/dev/null || fail "wait_for_hermes missing"
-grep -q "http://127.0.0.1:\$HERMES_WEB_PORT/health" "$SB" || fail "health probe URL wrong"
+grep -q "http://127.0.0.1:\$AGENT_WEB_PORT/health" "$SB" || fail "health probe URL wrong"
 
 # 4g. unit files are written just before QEMU may later be SIGTERM'd: the
 #     session overlay lost file DATA (0-byte file, mtime kept) twice, which

@@ -22,7 +22,7 @@ source "$SCRATCH/sb" 2>/dev/null
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-WEB="http://127.0.0.1:$HERMES_WEB_PORT"
+WEB="http://127.0.0.1:$AGENT_WEB_PORT"
 stamp="$SANDBOX_HOME/vm-image.stamp"
 envf="$INSTANCE_HOME/.env"
 
@@ -39,7 +39,7 @@ guest(){
 
 # 1. readiness + auth surface through HAProxy.
 code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$WEB/health" || true)"
-[[ "$code" == "200" ]] || fail "/health on :$HERMES_WEB_PORT returned '$code'"
+[[ "$code" == "200" ]] || fail "/health on :$AGENT_WEB_PORT returned '$code'"
 code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$WEB/login" || true)"
 [[ "$code" == "200" ]] || fail "login page returned '$code'"
 

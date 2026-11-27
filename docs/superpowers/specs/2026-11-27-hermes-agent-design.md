@@ -166,9 +166,14 @@ these ways (each deliberate):
   world-writable /tmp script), not a written-out file; secrets go to the
   root-owned `0600` `/etc/hermes/webui.env` (mirroring
   `/etc/opencode/server.env`), not `~/.hermes/.env`.
-- Ports follow the OpenCode pattern, not 8787: the web UI binds
-  `0.0.0.0:$HERMES_VM_PORT` (`19500+offset`, the QEMU hostfwd port) and
-  HAProxy publishes `$HERMES_WEB_PORT` (`9500+offset`).
+- Ports: the web UI binds `0.0.0.0:$AGENT_VM_PORT` (19090+offset, the QEMU
+  hostfwd port) and HAProxy publishes `$AGENT_WEB_PORT` (9090+offset) — not
+  8787. Originally Hermes had its own pair (9500/19500); the user then
+  asked for ONE port since only one agent runs at a time, so the two
+  agents now share `AGENT_WEB_PORT`/`AGENT_VM_PORT`: one HAProxy
+  frontend/backend pair, one hostfwd, one firewall accept. The shared
+  guest port doubles as a guard (whichever unit starts first owns it; the
+  other's bind fails), and OpenCode's published number never changed.
 - Sentinel gate hardened during review: `build` matches the marker anchored
   at line start (cloud-init's `final_message` mentions the string on every
   boot, so the old substring grep was vacuous — an aborted runcmd passed it),
