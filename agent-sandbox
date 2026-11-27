@@ -417,6 +417,29 @@ resolve_opencode_version() {
   echo "$version"
 }
 
+# Resolve the hermes-webui tag once per build (cached; honors the pin).
+HERMES_WEBUI_RESOLVED=""
+resolve_hermes_webui_version() {
+  if [[ -n "$HERMES_WEBUI_VERSION" ]]; then
+    echo "$HERMES_WEBUI_VERSION"
+    return
+  fi
+  if [[ -n "$HERMES_WEBUI_RESOLVED" ]]; then
+    echo "$HERMES_WEBUI_RESOLVED"
+    return
+  fi
+  local meta version
+  meta="$(curl -fsSL --max-time 30 "https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=1" 2>/dev/null || true)"
+  version="$(sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$meta" | head -n1)"
+  if [[ -z "$version" ]]; then
+    echo "ERROR: Could not resolve the latest hermes-webui tag from GitHub." >&2
+    echo "       Pin it with HERMES_WEBUI_VERSION=<tag> and retry." >&2
+    exit 1
+  fi
+  HERMES_WEBUI_RESOLVED="$version"
+  echo "$version"
+}
+
 #--------------------------------------------------------------------------------
 # PRE REQUISITES
 #--------------------------------------------------------------------------------
@@ -633,6 +656,14 @@ create_cloud_init() {
     extra_packages+="  - $pkg"$'\n'
   done
 
+  # Hermes pins for the guest installer: an explicit tag/branch clones by name
+  # (mode 'branch'); empty lets the official installer follow its stable
+  # channel (mode 'stable'). The web UI tag is always concrete.
+  local hermes_ref="$HERMES_VERSION" hermes_mode="stable"
+  [[ -n "$hermes_ref" ]] && hermes_mode="branch"
+  local webui_version
+  webui_version="$(resolve_hermes_webui_version)"
+
   cat >"$USER_DATA" <<EOF
 #cloud-config
 
@@ -654,6 +685,11 @@ packages:
   - vim-tiny
   - apparmor
   - docker.io
+  # libatomic1 is a hard requirement of the managed Node.js runtime the Hermes
+  # installer provisions; python3-venv lets the build inspect/extend Python
+  # environments. Nothing else is added to the lean image.
+  - python3-venv
+  - libatomic1
 $(echo -e "$extra_packages")
 # Nothing else. The golden image stays lean: no build toolchain, no python3-dev,
 # no node. Add what a project needs with EXTRA_PACKAGES="build-essential python3-pip".
@@ -687,6 +723,8 @@ runcmd:
   - install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode
   - rm -rf /tmp/opencode.tgz /tmp/package
   - opencode --version
+  # --- The second agent: Hermes Agent + hermes-webui (community web UI) ---
+  - agent-sandbox-install-hermes.sh "$hermes_ref" "$webui_version" "$hermes_mode"
   # --- Slim down the base image ---
   - apt-get purge -y --auto-remove snapd || true
   - rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd /etc/systemd/system/snapd.service.d /etc/apparmor.d/snap*
@@ -775,6 +813,56 @@ write_files:
       {
         "insecure-registries": ["$REGISTRY_ENDPOINT"]
       }
+  - path: /usr/local/bin/agent-sandbox-install-hermes.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Bakes Hermes Agent and hermes-webui into the golden image. Runs once at
+      # build time, as root. Args: <hermes-ref> <webui-tag> <mode:stable|branch>.
+      set -eux
+      hermes_ref="\$1"; webui_tag="\$2"; hermes_mode="\${3:-stable}"
+      agent_home="/home/$VM_AGENT_USER"
+
+      # 1. The agent: official installer (pinned toolchain it verifies itself),
+      # without the browser / computer-use extras (out of sandbox scope).
+      if [ "\$hermes_mode" = branch ]; then
+        runuser -l $VM_AGENT_USER -c "curl -fsSL --retry 5 https://raw.githubusercontent.com/NousResearch/hermes-agent/${hermes_ref}/scripts/install.sh | bash -s -- --non-interactive --skip-browser --skip-computer-use --branch ${hermes_ref}"
+      else
+        runuser -l $VM_AGENT_USER -c "curl -fsSL --retry 5 https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --non-interactive --skip-browser --skip-computer-use"
+      fi
+      runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes --version"
+
+      # 2. The web UI (pinned tag). It runs the agent in-process on the
+      # agent's own venv, so only two extra Python packages are needed.
+      git clone --depth 1 --branch "\$webui_tag" $HERMES_WEBUI_REPO_URL /opt/hermes-webui
+      agent_python="\$agent_home/.hermes/hermes-agent/.venv/bin/python"
+      if [ ! -x "\$agent_python" ]; then
+        # Fallback: whatever python the 'hermes' launcher wrapper execs.
+        agent_python="\$(sed -n 's/^exec[[:space:]]\{1,\}\([^[:space:]]*python[[:space:]]*\).*/\1/p' "\$agent_home/.local/bin/hermes" | head -n1)"
+      fi
+      if [ ! -x "\$agent_python" ]; then
+        echo "ERROR: could not locate the Hermes agent venv python." >&2
+        ls -l "\$agent_home/.hermes" "\$agent_home/.hermes/hermes-agent" >&2 || true
+        exit 1
+      fi
+      if ! "\$agent_python" -c 'import yaml, cryptography'; then
+        uv_bin="\$agent_home/.hermes/bin/uv"
+        [ -x "\$uv_bin" ] || uv_bin="\$(command -v uv)"
+        "\$uv_bin" pip install --python "\$agent_python" pyyaml cryptography
+      fi
+
+      # 3. Memory backend: initialize HERMES_HOME at build so the built-in
+      # stores (memories/MEMORY.md + USER.md, SQLite/FTS5 session db) exist and
+      # report healthy before the first boot. doctor may warn; memory status
+      # must pass.
+      runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes doctor" || echo "WARNING: hermes doctor reported issues (see build log)"
+      runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes memory status"
+      runuser -l $VM_AGENT_USER -c "test -d \$HOME/.hermes/memories"
+
+      # 4. Report the installed version to the serial console so 'build' can
+      # record it in the image stamp (same channel as PROVISION_SENTINEL).
+      hermes_ver="\$(runuser -l $VM_AGENT_USER -c "\$HOME/.local/bin/hermes --version" | head -n1)"
+      echo "AS-HERMES-VERSION \$hermes_ver" > /dev/console
 
 # Always power off: 'build' decides success from the marker in the serial log.
 # A condition here would leave QEMU running forever on any cloud-init warning,
@@ -887,11 +975,16 @@ _build() {
   local version root_password
   version="$(resolve_opencode_version)"
   root_password="$(random_password)"
+  local hermes_ref="$HERMES_VERSION" hermes_mode="stable" webui_version
+  [[ -n "$hermes_ref" ]] && hermes_mode="branch"
+  webui_version="$(resolve_hermes_webui_version)"
 
   echo
   echo "Base image : $DOWNLOAD_IMAGE"
   echo "OpenCode   : $OPENCODE_TARGET $version"
-  echo "Packages   : git rsync nftables ripgrep vim-tiny apparmor docker.io ${EXTRA_PACKAGES}"
+  echo "Hermes     : ${hermes_ref:-stable channel}"
+  echo "Web UI     : hermes-webui $webui_version"
+  echo "Packages   : git rsync nftables ripgrep vim-tiny apparmor docker.io python3-venv libatomic1 ${EXTRA_PACKAGES}"
   echo "Root pass  : $root_password"
   echo "             (SSH is key-only; this is for the serial console only)"
   echo
@@ -899,9 +992,17 @@ _build() {
   create_cloud_init "$extra_cmd" "$version" "$root_password"
   build_golden_image
 
+  # The agent reports its installed version to the serial console during
+  # provisioning (AS-HERMES-VERSION); the web UI tag was chosen host-side.
+  local hermes_installed
+  hermes_installed="$(sed -n 's/^AS-HERMES-VERSION //p' "$SANDBOX_HOME/build-serial.log" 2>/dev/null | tail -n1 | tr -d '\r[:space:]' || true)"
+  [[ -n "$hermes_installed" ]] || hermes_installed="unknown"
+
   {
     printf 'base_image=%s\n' "$DOWNLOAD_IMAGE"
     printf 'opencode=%s %s\n' "$OPENCODE_TARGET" "$version"
+    printf 'hermes=%s\n' "$hermes_installed"
+    printf 'hermes-webui=%s\n' "$webui_version"
     printf 'built=%s\n' "$(date -Is)"
   } > "$IMAGE_STAMP"
 
